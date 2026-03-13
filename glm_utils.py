@@ -14,6 +14,7 @@ import ssm
 
 npr.seed(65)
 
+
 def calculate_predictive_acc_glm(glm_weights, inpt, y, idx_to_exclude):
     M = inpt.shape[1]
     C = 2
