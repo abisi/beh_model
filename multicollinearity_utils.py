@@ -288,6 +288,7 @@ def plot_multicollinearity(results, figsize=(30, 20), save_path=None):
     ax1.set_xlabel('')
     ax1.set_ylabel('')
     ax1.tick_params(axis='both', labelsize=8)
+    ax1.set_xticklabels(ax1.get_xticklabels(), rotation=45, ha='right', fontsize=8)
     
     # 2. Session-level correlation matrix
     ax2 = fig.add_subplot(gs[0, 1])
@@ -360,6 +361,8 @@ def plot_multicollinearity(results, figsize=(30, 20), save_path=None):
     ax4.legend(loc='upper right', fontsize=9)
     ax4.grid(axis='y', alpha=0.3)
     ax4.set_ylim(bottom=0)
+    ax4.spines['top'].set_visible(False)
+    ax4.spines['right'].set_visible(False)
     
     # 5. Summary statistics panel
     ax5 = fig.add_subplot(gs[1, 2])
@@ -451,7 +454,7 @@ Trial-Level:
             ha='center', fontsize=10, style='italic',
             bbox=dict(boxstyle='round', facecolor='lightyellow', alpha=0.8, pad=0.5))
     
-    plt.tight_layout(rect=[0, 0.02, 1, 0.99])
+    #plt.tight_layout(rect=[0, 0.02, 1, 0.99])
     
     # Save if path provided
     if save_path:

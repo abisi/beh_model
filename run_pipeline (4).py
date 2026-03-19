@@ -1165,7 +1165,296 @@ def _load_single_trial_data(cfg, model_name: str, n_states: int) -> pd.DataFrame
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANALYSIS 1 – Per-mouse weight diagnostic: splits × states grid
+# ANALYSIS 1 – State alignment diagnostics (Hungarian algorithm)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_state_alignment_diagnostics(cfg, figure_path: Path, model_name: str = "full"):
+    """
+    For each (model_name, n_states > 1, reward_group):
+
+      1. Load raw weights long-form for all (split_idx, instance_idx).
+      2. Run utils.align_weights_dataframe (Hungarian algorithm) to find the
+         permutation that maps each (split, instance) to a common reference.
+      3. Produce three diagnostic figures per combination:
+
+         Fig A – "before" grid: rows = split × instance, cols = K states.
+                 Each cell is a bar chart of raw (unaligned) feature weights.
+         Fig B – "after"  grid: same layout but with states reordered by the
+                 computed permutation — good alignment → same state profile
+                 in the same column across all rows.
+         Fig C – permutation map: heatmap showing which original state index was
+                 mapped to which aligned state index for every (split, instance).
+         Fig D – summary: mean ± SE aligned weights per state, one subplot
+                 per state, averaged over all splits and instances.
+
+    Requires utils.align_weights_dataframe(df, use_mean_reference) which
+    returns (aligned_df, permutations_dict) where permutations_dict is keyed
+    by (n_states, split_idx, instance_idx).
+    """
+    from utils import align_weights_dataframe
+    from plotting_utils import remove_top_right_frame, save_figure_to_files
+
+    out_base = figure_path / "state_alignment" / model_name
+
+    feature_sets = build_feature_sets(cfg["features"], cfg.get("trial_types"))
+    feats = feature_sets.get(model_name, cfg["features"])
+
+    for rg_int in cfg["reward_groups"]:
+        rg    = _RG_STR.get(int(rg_int), str(rg_int))
+        color = _RG_COLOR.get(rg, "steelblue")
+        out_dir = out_base / rg
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        for n_states in sorted(cfg["n_states_list"]):
+            if n_states == 1:
+                continue  # alignment is trivial for K=1
+
+            # ── Collect raw weights: all splits × instances ───────────────────
+            rows = []
+            for split_idx in range(cfg["n_splits"]):
+                for instance_idx in range(cfg["n_instances"]):
+                    f = (global_model_dir(cfg, split_idx, n_states,
+                                         instance_idx, model_name, rg_int)
+                         / "global_fit_glmhmm_results.npz")
+                    if not f.exists():
+                        continue
+                    res = np.load(f, allow_pickle=True)["arr_0"].item()
+                    w   = np.array(res["weights"])   # (K, C-1, M)
+                    for s in range(w.shape[0]):
+                        for fi, feat in enumerate(feats):
+                            rows.append(dict(
+                                n_states=n_states,
+                                split_idx=split_idx,
+                                instance_idx=instance_idx,
+                                state_idx=s,
+                                feature=feat,
+                                weight=float(w[s, 0, fi]),
+                            ))
+
+            if not rows:
+                continue
+
+            wdf_raw = pd.DataFrame(rows)
+
+            # ── Run alignment ─────────────────────────────────────────────────
+            wdf_aligned, permutations = align_weights_dataframe(
+                wdf_raw.copy(), use_mean_reference=False
+            )
+
+            # Collect (split, instance) combos actually present
+            si_pairs = (
+                wdf_raw[["split_idx", "instance_idx"]]
+                .drop_duplicates()
+                .sort_values(["split_idx", "instance_idx"])
+                .values.tolist()
+            )
+            n_rows_grid = len(si_pairs)
+
+            def _weight_matrix(df, si_pairs, n_states, feats):
+                """Return dict (split,inst) → ndarray (K, M) in state_idx order."""
+                out = {}
+                for si, ii in si_pairs:
+                    sub = df[(df.split_idx == si) & (df.instance_idx == ii)]
+                    mat = np.zeros((n_states, len(feats)))
+                    for s in range(n_states):
+                        row = sub[sub.state_idx == s]
+                        for fi, feat in enumerate(feats):
+                            val = row[row.feature == feat]["weight"].values
+                            mat[s, fi] = val[0] if len(val) else 0.0
+                    out[(si, ii)] = mat
+                return out
+
+            mats_raw     = _weight_matrix(wdf_raw,     si_pairs, n_states, feats)
+            mats_aligned = _weight_matrix(wdf_aligned, si_pairs, n_states, feats)
+
+            # shared y-limits across all cells for comparability
+            all_w = np.concatenate([m.ravel() for m in mats_raw.values()])
+            ylim  = (float(all_w.min()) - 0.1, float(all_w.max()) + 0.1)
+
+            # ─────────────────────────────────────────────────────────────────
+            # Fig A – before alignment
+            # ─────────────────────────────────────────────────────────────────
+            fig_a, axs_a = plt.subplots(
+                n_rows_grid, n_states,
+                figsize=(2.8 * n_states, 2.0 * n_rows_grid),
+                dpi=180, constrained_layout=True, squeeze=False,
+            )
+            for row_i, (si, ii) in enumerate(si_pairs):
+                mat = mats_raw[(si, ii)]
+                for col_i in range(n_states):
+                    ax = axs_a[row_i, col_i]
+                    ax.bar(range(len(feats)), mat[col_i],
+                           color=color, alpha=0.70, width=0.7)
+                    ax.axhline(0, color="k", lw=0.5, ls="--")
+                    ax.set_ylim(ylim)
+                    ax.set_xticks(range(len(feats)))
+                    ax.set_xticklabels(
+                        feats if row_i == n_rows_grid - 1 else [],
+                        rotation=45, ha="right", fontsize=5,
+                    )
+                    ax.set_ylabel("w" if col_i == 0 else "", fontsize=6)
+                    ax.set_title(
+                        f"State {col_i+1}" if row_i == 0 else "",
+                        fontsize=7,
+                    )
+                    if col_i == n_states - 1:
+                        ax.set_ylabel(f"sp{si} i{ii}", fontsize=5,
+                                      rotation=0, labelpad=30, va="center")
+                        ax.yaxis.set_label_position("right")
+                    remove_top_right_frame(ax)
+
+            fig_a.suptitle(
+                f"BEFORE alignment | {model_name} K={n_states} | {rg}",
+                fontsize=9,
+            )
+            save_figure_to_files(
+                fig=fig_a, save_path=str(out_dir),
+                file_name=f"A_before_K{n_states}",
+                suffix=None, file_types=["pdf", "png"], dpi=180,
+            )
+            plt.close()
+
+            # ─────────────────────────────────────────────────────────────────
+            # Fig B – after alignment (same layout, permuted state columns)
+            # ─────────────────────────────────────────────────────────────────
+            fig_b, axs_b = plt.subplots(
+                n_rows_grid, n_states,
+                figsize=(2.8 * n_states, 2.0 * n_rows_grid),
+                dpi=180, constrained_layout=True, squeeze=False,
+            )
+            for row_i, (si, ii) in enumerate(si_pairs):
+                mat = mats_aligned[(si, ii)]
+                for col_i in range(n_states):
+                    ax = axs_b[row_i, col_i]
+                    ax.bar(range(len(feats)), mat[col_i],
+                           color=color, alpha=0.70, width=0.7)
+                    ax.axhline(0, color="k", lw=0.5, ls="--")
+                    ax.set_ylim(ylim)
+                    ax.set_xticks(range(len(feats)))
+                    ax.set_xticklabels(
+                        feats if row_i == n_rows_grid - 1 else [],
+                        rotation=45, ha="right", fontsize=5,
+                    )
+                    ax.set_ylabel("w" if col_i == 0 else "", fontsize=6)
+                    ax.set_title(
+                        f"State {col_i+1}" if row_i == 0 else "",
+                        fontsize=7,
+                    )
+                    if col_i == n_states - 1:
+                        ax.set_ylabel(f"sp{si} i{ii}", fontsize=5,
+                                      rotation=0, labelpad=30, va="center")
+                        ax.yaxis.set_label_position("right")
+                    remove_top_right_frame(ax)
+
+            fig_b.suptitle(
+                f"AFTER alignment | {model_name} K={n_states} | {rg}",
+                fontsize=9,
+            )
+            save_figure_to_files(
+                fig=fig_b, save_path=str(out_dir),
+                file_name=f"B_after_K{n_states}",
+                suffix=None, file_types=["pdf", "png"], dpi=180,
+            )
+            plt.close()
+
+            # ─────────────────────────────────────────────────────────────────
+            # Fig C – permutation map heatmap
+            # Each cell (row=split×inst, col=aligned state) shows the original
+            # state index that was mapped there.  Diagonal = no permutation.
+            # ─────────────────────────────────────────────────────────────────
+            perm_matrix = np.full((n_rows_grid, n_states), np.nan)
+            for row_i, (si, ii) in enumerate(si_pairs):
+                key = (n_states, si, ii)
+                if key in permutations:
+                    perm_matrix[row_i] = permutations[key]
+
+            fig_c, ax_c = plt.subplots(
+                figsize=(2.0 * n_states, 0.55 * n_rows_grid + 1.0),
+                dpi=180, constrained_layout=True,
+            )
+            im = ax_c.imshow(perm_matrix, cmap="tab10",
+                             vmin=0, vmax=n_states - 1,
+                             aspect="auto", interpolation="nearest")
+
+            # Annotate each cell with the mapped original state index
+            for row_i in range(n_rows_grid):
+                for col_i in range(n_states):
+                    val = perm_matrix[row_i, col_i]
+                    if not np.isnan(val):
+                        ax_c.text(col_i, row_i, str(int(val)),
+                                  ha="center", va="center",
+                                  fontsize=7, color="white",
+                                  fontweight="bold")
+
+            ax_c.set_xticks(range(n_states))
+            ax_c.set_xticklabels([f"Aligned\nstate {s}" for s in range(n_states)],
+                                 fontsize=7)
+            ax_c.set_yticks(range(n_rows_grid))
+            ax_c.set_yticklabels([f"sp{si} i{ii}" for si, ii in si_pairs],
+                                 fontsize=6)
+            ax_c.set_xlabel("Aligned state index", fontsize=8)
+            ax_c.set_ylabel("Split / instance", fontsize=8)
+
+            plt.colorbar(im, ax=ax_c, shrink=0.6,
+                         label="Original state index")
+            fig_c.suptitle(
+                f"Permutation map | {model_name} K={n_states} | {rg}",
+                fontsize=9,
+            )
+            save_figure_to_files(
+                fig=fig_c, save_path=str(out_dir),
+                file_name=f"C_permutation_map_K{n_states}",
+                suffix=None, file_types=["pdf", "png"], dpi=180,
+            )
+            plt.close()
+
+            # ─────────────────────────────────────────────────────────────────
+            # Fig D – summary: mean ± SE of aligned weights, one subplot / state
+            # ─────────────────────────────────────────────────────────────────
+            fig_d, axs_d = plt.subplots(
+                1, n_states,
+                figsize=(3.2 * n_states, 3.2),
+                dpi=220, constrained_layout=True, squeeze=False,
+            )
+            for s_i in range(n_states):
+                ax = axs_d[0, s_i]
+                sub = wdf_aligned[wdf_aligned.state_idx == s_i]
+                grp = (
+                    sub.groupby("feature")["weight"]
+                    .agg(["mean", "sem"])
+                    .reindex(feats)
+                    .reset_index()
+                )
+                ax.bar(range(len(feats)), grp["mean"],
+                       yerr=grp["sem"], color=color,
+                       alpha=0.75, capsize=3, width=0.6,
+                       error_kw={"lw": 0.8})
+                ax.axhline(0, color="k", lw=0.5, ls="--")
+                ax.set_xticks(range(len(feats)))
+                ax.set_xticklabels(feats, rotation=45, ha="right", fontsize=6)
+                ax.set_ylabel("Weight (mean ± SE)" if s_i == 0 else "",
+                              fontsize=7)
+                ax.set_title(f"State {s_i+1}", fontsize=8)
+                remove_top_right_frame(ax)
+
+            n_si = len(si_pairs)
+            fig_d.suptitle(
+                f"Aligned weights summary | {model_name} K={n_states} | {rg}"
+                f"  (n={n_si} split×inst)",
+                fontsize=9,
+            )
+            save_figure_to_files(
+                fig=fig_d, save_path=str(out_dir),
+                file_name=f"D_aligned_summary_K{n_states}",
+                suffix=None, file_types=["pdf", "png"], dpi=220,
+            )
+            plt.close()
+
+    logger.info(f"  [1] State alignment diagnostics → {out_base}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ANALYSIS 2 – Per-mouse weight diagnostic: splits × states grid
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_mouse_weight_splits(cfg, figure_path: Path, model_name: str = "full"):
@@ -1259,26 +1548,29 @@ def plot_mouse_weight_splits(cfg, figure_path: Path, model_name: str = "full"):
                 )
                 plt.close()
 
-    logger.info(f"  [1] Per-mouse weight diagnostics → {out_base}")
+    logger.info(f"  [2] Per-mouse weight diagnostics → {out_base}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANALYSIS 2 – Average posterior probability curve across trials, per day
+# ANALYSIS 3 – Average posterior probability curve across trials, per day
 # ─────────────────────────────────────────────────────────────────────────────
 
-def plot_posterior_curves_by_day(cfg, figure_path: Path, model_name: str = "full"):
+def plot_posterior_curves_by_day(cfg, figure_path: Path, model_name: str = "full",
+                                  max_trials: int = 300):
     """
     For each (reward_group, training day) and each K in n_states_list, plot the
-    trial-averaged posterior probability of each state as a function of
-    within-session trial index.
+    trial-averaged posterior probability of every state on a single axis, with
+    the inter-mouse standard deviation shown as a shaded band.
 
-    Layout: one figure per (reward_group, day).
-    Rows = number of states K,  cols = individual states (posterior_state_*).
+    Each session is aligned to trial index 0 independently (cumcount per
+    session_id), and only the first `max_trials` trials are shown.
+
+    Layout: one figure per (reward_group, day, K).
+    All states overlaid on one axis; mean = solid line, ±1 SD = shaded band.
     """
     from plotting_utils import remove_top_right_frame, save_figure_to_files
 
     out_base = figure_path / "posterior_curves" / model_name
-    state_colors = sns.color_palette("tab10", max(cfg["n_states_list"]))
 
     for n_states in sorted(cfg["n_states_list"]):
         trial_df = _load_single_trial_data(cfg, model_name, n_states)
@@ -1292,13 +1584,16 @@ def plot_posterior_curves_by_day(cfg, figure_path: Path, model_name: str = "full
         if not post_cols:
             continue
 
-        # within-session trial index
+        state_colors = sns.color_palette("tab10", n_states)
+
+        # ── Align every session independently to trial index 0, cap at max_trials
         trial_df["trial_in_session"] = (
             trial_df.groupby(["mouse_id", "session_id"]).cumcount()
         )
+        trial_df = trial_df[trial_df["trial_in_session"] < max_trials]
 
-        rgs   = sorted(trial_df["reward_group"].unique())
-        days  = sorted(trial_df["day"].unique()) if "day" in trial_df.columns else [None]
+        rgs  = sorted(trial_df["reward_group"].unique())
+        days = sorted(trial_df["day"].unique()) if "day" in trial_df.columns else [None]
 
         for rg in rgs:
             for day in days:
@@ -1308,34 +1603,49 @@ def plot_posterior_curves_by_day(cfg, figure_path: Path, model_name: str = "full
                 if sub.empty:
                     continue
 
-                # average across mice at each trial position
-                avg = (
-                    sub.groupby("trial_in_session")[post_cols]
+                # ── Per-mouse mean at each trial position, then group stats
+                # Step 1: average within each mouse across sessions of the same day
+                mouse_avg = (
+                    sub.groupby(["mouse_id", "trial_in_session"])[post_cols]
                     .mean()
                     .reset_index()
                 )
+                # Step 2: mean and std across mice at each trial position
+                grp   = mouse_avg.groupby("trial_in_session")[post_cols]
+                means = grp.mean()
+                stds  = grp.std(ddof=1).fillna(0)
 
-                fig, axs = plt.subplots(
-                    1, n_states,
-                    figsize=(3.5 * n_states, 3),
-                    dpi=200, sharey=True, constrained_layout=True,
-                    squeeze=False,
-                )
+                trial_idx = means.index.values
+
+                # ── Single-axis figure, all states overlaid
+                fig, ax = plt.subplots(figsize=(7, 3.5), dpi=200,
+                                       constrained_layout=True)
+
+                ax.axhline(1 / n_states, color="grey", lw=0.6, ls="--",
+                           label="uniform prior")
 
                 for s_i, pcol in enumerate(post_cols):
-                    ax = axs[0, s_i]
-                    ax.plot(avg["trial_in_session"], avg[pcol],
-                            color=state_colors[s_i], lw=1.5)
-                    ax.set_ylim(-0.02, 1.02)
-                    ax.set_xlabel("Trial in session", fontsize=8)
-                    ax.set_ylabel("P(state)" if s_i == 0 else "", fontsize=8)
-                    ax.set_title(f"State {s_i+1}", fontsize=8)
-                    ax.axhline(1 / n_states, color="grey", lw=0.6, ls="--")
-                    remove_top_right_frame(ax)
+                    color = state_colors[s_i]
+                    mean  = means[pcol].values
+                    sd    = stds[pcol].values
+                    ax.plot(trial_idx, mean,
+                            color=color, lw=1.8, label=f"State {s_i + 1}")
+                    ax.fill_between(trial_idx,
+                                    mean - sd, mean + sd,
+                                    color=color, alpha=0.15)
+
+                ax.set_xlim(0, max_trials - 1)
+                ax.set_ylim(-0.02, 1.02)
+                ax.set_xlabel("Trial in session", fontsize=9)
+                ax.set_ylabel("P(state)", fontsize=9)
+                ax.legend(frameon=False, fontsize=7, loc="upper right")
+                remove_top_right_frame(ax)
 
                 day_str = f"day{day}" if day is not None else "alldays"
+                n_mice  = mouse_avg["mouse_id"].nunique()
                 fig.suptitle(
-                    f"Avg posterior | {model_name} K={n_states} | {rg} | {day_str}",
+                    f"Posterior | {model_name} K={n_states} | {rg} | {day_str}"
+                    f"  (n={n_mice} mice, first {max_trials} trials)",
                     fontsize=9,
                 )
 
@@ -1348,11 +1658,11 @@ def plot_posterior_curves_by_day(cfg, figure_path: Path, model_name: str = "full
                 )
                 plt.close()
 
-    logger.info(f"  [2] Posterior curves by day → {out_base}")
+    logger.info(f"  [3] Posterior curves by day → {out_base}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANALYSIS 3 – Global model weights per state, hue = reward_group
+# ANALYSIS 4 – Global model weights per state, hue = reward_group
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_global_weights_by_rg(cfg, figure_path: Path):
@@ -1424,11 +1734,11 @@ def plot_global_weights_by_rg(cfg, figure_path: Path):
             )
             plt.close()
 
-    logger.info(f"  [3] Global weights by reward group → {out_base}")
+    logger.info(f"  [4] Global weights by reward group → {out_base}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANALYSIS 4 – Single-mouse weights per state, hue = reward_group
+# ANALYSIS 5 – Single-mouse weights per state, hue = reward_group
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_single_weights_by_rg(cfg, figure_path: Path):
@@ -1520,11 +1830,11 @@ def plot_single_weights_by_rg(cfg, figure_path: Path):
             )
             plt.close()
 
-    logger.info(f"  [4] Single-mouse weights by reward group → {out_base}")
+    logger.info(f"  [5] Single-mouse weights by reward group → {out_base}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ANALYSIS 5 – Lick rate per trial type × state, for each reward group
+# ANALYSIS 6 – Lick rate per trial type × state, for each reward group
 # ─────────────────────────────────────────────────────────────────────────────
 
 def plot_lick_rate_per_state(cfg, figure_path: Path, model_name: str = "full"):
@@ -1652,7 +1962,7 @@ def plot_lick_rate_per_state(cfg, figure_path: Path, model_name: str = "full"):
             )
             plt.close()
 
-    logger.info(f"  [5] Lick rate per state → {out_base}")
+    logger.info(f"  [6] Lick rate per state → {out_base}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1722,39 +2032,47 @@ def stage_plot_performance(cfg, model_name_for_per_mouse: str = "full"):
     except FileNotFoundError as e:
         logger.warning(f"  Skipping per-mouse performance plots: {e}")
 
-    # ── Analysis 1 – per-mouse weight diagnostic grid ─────────────────────────
+    # ── Analysis 1 – state alignment diagnostics (run first, gates all downstream)
     feature_sets = build_feature_sets(cfg["features"], cfg.get("trial_types"))
+    for mname in feature_sets:
+        try:
+            plot_state_alignment_diagnostics(cfg, figure_path, model_name=mname)
+        except Exception as e:
+            logger.warning(f"  [1] state alignment failed for {mname}: {e}")
+
+    # ── Analysis 2 – per-mouse weight diagnostic grid ─────────────────────────
     for mname in feature_sets:
         try:
             plot_mouse_weight_splits(cfg, figure_path, model_name=mname)
         except Exception as e:
-            logger.warning(f"  [1] weight diagnostics failed for {mname}: {e}")
+            logger.warning(f"  [2] weight diagnostics failed for {mname}: {e}")
 
-    # ── Analysis 2 – posterior curves by day ──────────────────────────────────
+    # ── Analysis 3 – posterior curves by day ──────────────────────────────────
     for mname in feature_sets:
         try:
-            plot_posterior_curves_by_day(cfg, figure_path, model_name=mname)
+            plot_posterior_curves_by_day(cfg, figure_path, model_name=mname,
+                                         max_trials=cfg.get("posterior_max_trials", 300))
         except Exception as e:
-            logger.warning(f"  [2] posterior curves failed for {mname}: {e}")
+            logger.warning(f"  [3] posterior curves failed for {mname}: {e}")
 
-    # ── Analysis 3 – global weights, hue = reward_group ───────────────────────
+    # ── Analysis 4 – global weights, hue = reward_group ───────────────────────
     try:
         plot_global_weights_by_rg(cfg, figure_path)
     except Exception as e:
-        logger.warning(f"  [3] global weights by rg failed: {e}")
+        logger.warning(f"  [4] global weights by rg failed: {e}")
 
-    # ── Analysis 4 – single-mouse weights, hue = reward_group ─────────────────
+    # ── Analysis 5 – single-mouse weights, hue = reward_group ─────────────────
     try:
         plot_single_weights_by_rg(cfg, figure_path)
     except Exception as e:
-        logger.warning(f"  [4] single weights by rg failed: {e}")
+        logger.warning(f"  [5] single weights by rg failed: {e}")
 
-    # ── Analysis 5 – lick rate per trial type × state ─────────────────────────
+    # ── Analysis 6 – lick rate per trial type × state ─────────────────────────
     for mname in feature_sets:
         try:
             plot_lick_rate_per_state(cfg, figure_path, model_name=mname)
         except Exception as e:
-            logger.warning(f"  [5] lick rate per state failed for {mname}: {e}")
+            logger.warning(f"  [6] lick rate per state failed for {mname}: {e}")
 
     logger.info(f"Stage 4 complete. Figures → {figure_path}\n")
 
@@ -1780,8 +2098,8 @@ def parse_args():
     p.add_argument("--n_workers",     type=int,              default=None)
     p.add_argument("--plot_model",    type=str,              default="full",
                    help="model_name (feature set) to use for per-mouse performance plot")
-    p.add_argument("--figure_path",   type=str,              default=None,
-                   help="Override output directory for figures")
+    p.add_argument("--posterior_max_trials", type=int, default=None,
+                   help="Max trials per session for posterior curves (default: 300)")
     return p.parse_args()
 
 
@@ -1795,7 +2113,8 @@ def main():
     if args.kappa           is not None: cfg["kappa"]           = args.kappa
     if args.reward_groups   is not None: cfg["reward_groups"]   = args.reward_groups
     if args.n_workers       is not None: cfg["n_workers"]       = args.n_workers
-    if args.figure_path     is not None: cfg["figure_path"]     = Path(args.figure_path)
+    if args.figure_path     is not None: cfg["figure_path"]           = Path(args.figure_path)
+    if args.posterior_max_trials is not None: cfg["posterior_max_trials"] = args.posterior_max_trials
 
     run_all     = "all" in args.stages
     run_dataset = (run_all or "dataset" in args.stages) and cfg["run_dataset"]

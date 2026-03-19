@@ -8,6 +8,7 @@
 
 # Imports
 import os
+import logging
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -15,6 +16,16 @@ from pathlib import Path
 from matplotlib import pyplot as plt
 from multiprocessing import Pool
 import scipy as sp
+
+import warnings
+warnings.simplefilter("ignore", UserWarning)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
 
 import config
 import NWB_reader_functions as NWB_read
@@ -137,34 +148,20 @@ def _extract_window_metrics(bp_data, bp_ts, start_times, t_start, t_end, is_pupi
 # ── Per-session processing ─────────────────────────────────────────────────────
 
 def _process_single_session(args):
-    """
-    Process one NWB session file into a behavioral DataFrame.
-
-    Parameters
-    ----------
-    args : tuple of (nwb_file, mouse_info_df, n_trials_max)
-
-    Returns
-    -------
-    pd.DataFrame, or None if the session should be skipped
-    """
     nwb_file, mouse_info_df, n_trials_max = args
-    print(f"Processing {nwb_file}...")
 
     # ---------------------------
     # Load and filter trial table
     # ---------------------------
-    trial_df      = NWB_read.get_trial_table(nwb_file)
+    trial_df = NWB_read.get_trial_table(nwb_file)
     behavior_type, day = NWB_read.get_bhv_type_and_training_day_index(nwb_file)
     trial_df['behavior'] = behavior_type
     trial_df['day']      = day
-
     trial_df = reindex_whisker_days(trial_df)
 
     if n_trials_max is not None:
         trial_df = trial_df.iloc[:n_trials_max]
 
-    # Remove passive trials, early licks, and association trials
     trial_df = trial_df[(trial_df['context'] != 'passive') & (trial_df['perf'] != 6)]
 
     if behavior_type != 'whisker':
@@ -174,141 +171,126 @@ def _process_single_session(args):
     session_id   = NWB_read.get_session_id(nwb_file)
     reward_group = mouse_info_df.loc[mouse_info_df['mouse_id'] == mouse_id, 'reward_group'].values[0]
 
-    # ---------------------------
-    # Session metadata
-    # ---------------------------
-    data_df = pd.DataFrame(index=trial_df.index)
-    data_df['mouse_id']   = mouse_id
-    data_df['wh_reward']  = reward_group
-    data_df['behavior']   = behavior_type
-    data_df['session_id'] = session_id
-    data_df['day']        = day
+    tt       = trial_df['trial_type']
+    lick     = trial_df['lick_flag']
+    is_aud   = (tt == 'auditory_trial')
+    is_wh    = (tt == 'whisker_trial')
+    is_stim  = is_aud | is_wh
+    lick_correct = trial_df['perf'].map({0: 0, 1: 0, 2: 1, 3: 1, 4: 0, 5: 0})
 
     # ---------------------------
-    # Choice
+    # Reward given
     # ---------------------------
-    data_df['trial_id']    = trial_df.index
-    data_df['choice']      = trial_df['lick_flag']
-    data_df['prev_choice'] = data_df['choice'].shift(1).astype('int32', errors='ignore')
-
-    # ---------------------------
-    # Stimulus encoding features
-    # ---------------------------
-    # Build all trial-type indicator columns in one pass
-    tt = trial_df['trial_type']
-    data_df['auditory']      = (tt == 'auditory_trial').astype(int)
-    data_df['whisker']       = (tt == 'whisker_trial').astype(int)
-    data_df['is_stimulus']   = ((tt == 'auditory_trial') | (tt == 'whisker_trial')).astype(int)
-    data_df['prev_auditory'] = data_df['auditory'].shift(1).astype('int32', errors='ignore')
-    data_df['prev_whisker']  = data_df['whisker'].shift(1).astype('int32', errors='ignore')
-
-    data_df['lick_correct'] = trial_df['perf'].map({0: 0, 1: 0, 2: 1, 3: 1, 4: 0, 5: 0})
-
-    # ---------------------------
-    # Reward features (vectorised)
-    # ---------------------------
-    aud_reward = (data_df['auditory'] == 1) & (data_df['lick_correct'] == 1)
-    wh_lick    = (data_df['whisker']  == 1) & (data_df['lick_correct'] == 1)
-
-    data_df['reward_given'] = 0
-    data_df.loc[aud_reward, 'reward_given'] = 1
+    reward_given = np.zeros(len(trial_df), dtype=np.int32)
+    reward_given[is_aud.values & (lick_correct == 1).values] = 1
     if reward_group == 'R+':
-        data_df.loc[wh_lick, 'reward_given'] = 1
-    # R- mice: whisker licks are never rewarded (reward_given stays 0)
+        reward_given[is_wh.values & (lick_correct == 1).values] = 1
+
+    # ---------------------------
+    # Build data_df in one shot
+    # ---------------------------
+    data_df = pd.DataFrame({
+        'mouse_id'   : mouse_id,
+        'wh_reward'  : reward_group,
+        'behavior'   : behavior_type,
+        'session_id' : session_id,
+        'day'        : day,
+        'trial_id'   : trial_df.index,
+        'choice'     : lick.values,
+        'auditory'   : is_aud.astype(int).values,
+        'whisker'    : is_wh.astype(int).values,
+        'is_stimulus': is_stim.astype(int).values,
+        'lick_correct': lick_correct.values,
+        'reward_given': reward_given,
+    }, index=trial_df.index)
+
+    # ---------------------------
+    # Lagged choice / stimulus
+    # ---------------------------
+    for src, dst in [('choice',   'prev_choice'),
+                     ('auditory', 'prev_auditory'),
+                     ('whisker',  'prev_whisker'),
+                     ('reward_given', 'prev_trial_reward_given')]:
+        data_df[dst] = data_df[src].shift(1).fillna(0).astype(np.int32)
 
     data_df['unrewarded_lick'] = (
-        (data_df['lick_correct'] == 0) & (data_df['is_stimulus'] == 1)
-    ).astype(int)
+        (lick_correct == 0) & is_stim
+    ).astype(np.int32).values
 
-    # Previous-trial reward (including no-stim trials)
-    data_df['prev_trial_reward_given'] = data_df['reward_given'].shift(1).astype('int32', errors='ignore')
-
-    # Previous stimulus-trial reward — shift within stim rows only, then ffill
-    stim_mask = data_df['is_stimulus'] == 1
+    # ---------------------------
+    # Previous stimulus-trial values (shift within stim rows, ffill)
+    # ---------------------------
+    stim_idx = data_df.index[data_df['is_stimulus'] == 1]
     for src, dst in [('reward_given', 'prev_stim_reward_given'),
                      ('auditory',     'prev_stim_auditory'),
                      ('whisker',      'prev_stim_whisker')]:
-        # .shift(1) on a filtered Series gives the previous stim-trial value at each stim position
-        data_df.loc[stim_mask, dst] = data_df.loc[stim_mask, src].shift(1).values
-
-    stim_cols = ['prev_stim_reward_given', 'prev_stim_auditory', 'prev_stim_whisker']
-    # Forward-fill non-stim rows with the last stim value, then fill initial NaNs with 0
-    data_df[stim_cols] = data_df[stim_cols].ffill().fillna(0)
+        shifted = data_df.loc[stim_idx, src].shift(1)
+        data_df[dst] = shifted.reindex(data_df.index).ffill().fillna(0)
 
     # ---------------------------
-    # Time since last stimulus / lick / reward
+    # Win-stay / lose-shift
+    # ---------------------------
+    data_df['wsls'] = data_df['prev_choice'] * data_df['prev_trial_reward_given']
+
+    wh_idx = data_df.index[data_df['whisker'] == 1]
+    for src, dst in [('choice', 'prev_wh_choice'), ('reward_given', 'prev_wh_reward')]:
+        shifted = data_df.loc[wh_idx, src].shift(1)
+        data_df[dst] = shifted.reindex(data_df.index).ffill().fillna(0)
+    data_df['wsls_whisker'] = data_df['prev_wh_choice'] * data_df['prev_wh_reward']
+
+    # ---------------------------
+    # Time since last event (8 flags built vectorised, then normed)
     # ---------------------------
     trial_df['start_time_diff'] = trial_df['start_time'].diff(1).fillna(0)
 
-    # Stimulus flags
-    trial_df['whisker_stim_flag']  = (tt == 'whisker_trial').astype(int)
-    trial_df['auditory_stim_flag'] = (tt == 'auditory_trial').astype(int)
+    event_flags = {
+        'whisker_stim_flag'    : is_wh.astype(int),
+        'auditory_stim_flag'   : is_aud.astype(int),
+        'whisker_lick_flag'    : ((lick == 1) & is_wh).astype(int),
+        'auditory_lick_flag'   : ((lick == 1) & is_aud).astype(int),
+        'reward_flag'          : pd.Series(reward_given, index=trial_df.index),
+        'whisker_reward_flag'  : ((lick == 1) & is_wh).astype(int) if reward_group == 'R+' else pd.Series(0, index=trial_df.index),
+        'auditory_reward_flag' : ((lick == 1) & is_aud).astype(int),
+    }
+    for col, vals in event_flags.items():
+        trial_df[col] = vals
+        compute_time_since_last_event_norm(trial_df, col)
 
-    compute_time_since_last_event_norm(trial_df, 'whisker_stim_flag')
-    compute_time_since_last_event_norm(trial_df, 'auditory_stim_flag')
-
-    data_df['time_since_last_whisker_stim']  = trial_df['whisker_stim_flag_norm']
-    data_df['time_since_last_auditory_stim'] = trial_df['auditory_stim_flag_norm']
-
-    # Lick flags
-    trial_df['whisker_lick_flag']  = ((trial_df['lick_flag'] == 1) & (tt == 'whisker_trial')).astype(int)
-    trial_df['auditory_lick_flag'] = ((trial_df['lick_flag'] == 1) & (tt == 'auditory_trial')).astype(int)
-
-    compute_time_since_last_event_norm(trial_df, 'whisker_lick_flag')
-    compute_time_since_last_event_norm(trial_df, 'auditory_lick_flag')
-
-    data_df['time_since_last_whisker_lick']  = trial_df['whisker_lick_flag_norm']
-    data_df['time_since_last_auditory_lick'] = trial_df['auditory_lick_flag_norm']
-
-    # Reward flags
-    reward_filters = {'R+': ['auditory_trial', 'whisker_trial'], 'R-': ['auditory_trial']}
-    trial_df['reward_flag'] = (
-        (trial_df['lick_flag'] == 1) & (tt.isin(reward_filters[reward_group]))
-    ).astype(int)
-    trial_df['whisker_reward_flag']  = (
-        ((trial_df['lick_flag'] == 1) & (tt == 'whisker_trial')).astype(int)
-        if reward_group == 'R+' else 0
-    )
-    trial_df['auditory_reward_flag'] = (
-        (trial_df['lick_flag'] == 1) & (tt == 'auditory_trial')
-    ).astype(int)
-
-    compute_time_since_last_event_norm(trial_df, 'reward_flag')
-    compute_time_since_last_event_norm(trial_df, 'whisker_reward_flag')
-    compute_time_since_last_event_norm(trial_df, 'auditory_reward_flag')
-
-    data_df['time_since_last_reward']          = trial_df['reward_flag_norm']
-    data_df['time_since_last_whisker_reward']  = trial_df['whisker_reward_flag_norm']
-    data_df['time_since_last_auditory_reward'] = trial_df['auditory_reward_flag_norm']
+    data_df['time_since_last_whisker_stim']    = trial_df['whisker_stim_flag_norm'].values
+    data_df['time_since_last_auditory_stim']   = trial_df['auditory_stim_flag_norm'].values
+    data_df['time_since_last_whisker_lick']    = trial_df['whisker_lick_flag_norm'].values
+    data_df['time_since_last_auditory_lick']   = trial_df['auditory_lick_flag_norm'].values
+    data_df['time_since_last_reward']          = trial_df['reward_flag_norm'].values
+    data_df['time_since_last_whisker_reward']  = trial_df['whisker_reward_flag_norm'].values
+    data_df['time_since_last_auditory_reward'] = trial_df['auditory_reward_flag_norm'].values
 
     # ---------------------------
     # Reaction time (normalised)
     # ---------------------------
-    rt = trial_df['lick_time'] - trial_df['response_window_start_time']
-    rt_min, rt_max = rt.min(), rt.max()
+    rt = (trial_df['lick_time'] - trial_df['response_window_start_time']).values
+    rt_min, rt_max = np.nanmin(rt), np.nanmax(rt)
     denom = rt_max - rt_min
     data_df['reaction_time_piezo'] = (rt - rt_min) / denom if denom > 0 else 0.0
 
     # ---------------------------
-    # Cumulative reward (normalised within session) and recent reward rate
+    # Reward rate (rolling window, no groupby needed — single session)
     # ---------------------------
-    cum = data_df['reward_given'].cumsum()
-    cum_max = cum.max()
-    data_df['cumulative_reward'] = cum / cum_max if cum_max > 0 else 0.0
-
     window_len = 5
-    data_df['recent_reward_count'] = data_df.groupby('session_id')['reward_given'].transform(lambda x: x.rolling(window=window_len, min_periods=1).sum())
-    data_df['recent_reward_rate'] = data_df['recent_reward_count'] / window_len
-
+    data_df['recent_reward_rate'] = (
+        data_df['reward_given']
+        .rolling(window=window_len, min_periods=window_len)
+        .mean()
+        .fillna(0.0)
+    )
 
     # ---------------------------
-    # Constant bias term / ITI
+    # Bias / ITI
     # ---------------------------
     data_df['bias'] = 1
-    data_df['iti']  = trial_df['start_time_diff']
+    data_df['iti']  = trial_df['start_time_diff'].values
 
     # ---------------------------
-    # DLC movement features (vectorised window extraction)
+    # DLC movement features
     # ---------------------------
     bodyparts = ['jaw_distance', 'nose_norm_distance', 'whisker_angle', 'pupil_area']
     dlc = NWB_read.get_dlc_data_dict(nwb_file)
@@ -318,7 +300,6 @@ def _process_single_session(args):
         return data_df
 
     start_times = trial_df['start_time'].values
-    raw_metrics = {}  # store un-normalised values for batch normalisation below
 
     for bp in bodyparts:
         if bp not in dlc or isinstance(dlc[bp]['data'], float):
@@ -327,114 +308,24 @@ def _process_single_session(args):
         bp_data = np.asarray(dlc[bp]['data'], dtype=float)
         bp_ts   = np.asarray(dlc[bp]['timestamps'], dtype=float)
 
-        # --- Fix length mismatch ---
-        if len(bp_data) != len(bp_ts):
-            max_len = max(len(bp_data), len(bp_ts))
-            def _pad(arr):
-                if len(arr) >= max_len:
-                    return arr
-                out = np.full(max_len, np.nan)
-                idx = np.random.choice(max_len, size=len(arr), replace=False)
-                out[idx] = arr
-                return out
-            bp_data = _pad(bp_data)
-            bp_ts   = _pad(bp_ts)
+        # Trim to the shorter length (random scattering was incorrect)
+        min_len = min(len(bp_data), len(bp_ts))
+        bp_data, bp_ts = bp_data[:min_len], bp_ts[:min_len]
 
-        # FIX: capture the return value (was silently discarded before)
         bp_data = preprocess_dlc_trace(bp_data)
 
-        # Ensure timestamps are sorted for searchsorted
         if not np.all(np.diff(bp_ts[~np.isnan(bp_ts)]) >= 0):
             sort_idx = np.argsort(bp_ts)
             bp_ts, bp_data = bp_ts[sort_idx], bp_data[sort_idx]
 
-        # Vectorised extraction (replaces the per-trial boolean-mask loop)
         window = (-0.5, 0) if bp == 'pupil_area' else (-0.2, 0)
-        t_start, t_end = window
         metrics = _extract_window_metrics(
-            bp_data, bp_ts, start_times, t_start, t_end, is_pupil=(bp == 'pupil_area')
+            bp_data, bp_ts, start_times, *window, is_pupil=(bp == 'pupil_area')
         )
 
-        raw_metrics[bp] = metrics
-
-    # Batch min-max normalisation for all bodyparts
-    for bp, metrics in raw_metrics.items():
-        min_val = np.nanmin(metrics)
-        max_val = np.nanmax(metrics)
-        denom   = max_val - min_val
+        min_val, max_val = np.nanmin(metrics), np.nanmax(metrics)
+        denom = max_val - min_val
         data_df[bp] = (metrics - min_val) / denom if denom > 0 else 0.0
-
-    plot_dataset = False
-    if plot_dataset:
-        features = config.FEATURES
-
-        # Report any NaN/inf columns
-        for col in features:
-            if col not in data_df.columns:
-                continue
-            if np.isnan(data_df[col]).any():
-                nan_rows = data_df[np.isnan(data_df[col])]
-                print(f'NaN in "{col}":\n{nan_rows[["mouse_id", "session_id", "day", "trial_id"]]}')
-
-        cols_to_plot = [
-            'choice', 'reaction_time_piezo',
-            'auditory', 'time_since_last_auditory_stim', 'time_since_last_auditory_lick',
-            'whisker', 'time_since_last_whisker_stim', 'time_since_last_whisker_lick',
-            'jaw_distance', 'nose_norm_distance', 'whisker_angle', 'pupil_area',
-            'cumulative_reward', 'recent_reward_rate',
-        ]
-
-        for (mouse_id, day), session_data in data_df.groupby(['mouse_id', 'day']):
-            feature_mat = session_data[cols_to_plot].values
-            n_rows = feature_mat.shape[1]
-
-            for i, col in enumerate(cols_to_plot):
-                col_vals = feature_mat[:, i]
-                if np.isinf(col_vals).any():
-                    print(f'Inf in "{col}" — mouse={mouse_id}, day={day}')
-                if np.isnan(col_vals).any():
-                    print(f'NaN in "{col}" — mouse={mouse_id}, day={day}')
-
-            start_id, n_trials = 20, 50
-            mat = feature_mat[start_id:start_id + n_trials].T
-
-            group1 = slice(0, 1)
-            group2 = slice(1, 2)
-            group3 = slice(2, 5)
-            group4 = slice(5, 8)
-            group5 = slice(8, n_rows)
-            cmap_mvt = 'RdPu'
-            cmap_mvt.set_bad('grey')
-
-            fig, ax = plt.subplots(1, 1, dpi=400)
-            im = ax.imshow(mat[group1], aspect='equal', cmap='Greys',
-                           interpolation='none', extent=[0, n_trials, group1.stop, group1.start])
-            ax.imshow(mat[group2], aspect='equal', cmap='copper',
-                      interpolation='none', extent=[0, n_trials, group2.stop, group2.start])
-            ax.imshow(mat[group3], aspect='equal', cmap='Blues',
-                      interpolation='none', extent=[0, n_trials, group3.stop, group3.start])
-            ax.imshow(mat[group4], aspect='equal', cmap='Oranges',
-                      interpolation='none', extent=[0, n_trials, group4.stop, group4.start])
-            ax.imshow(mat[group5], aspect='equal', cmap=cmap_mvt,
-                      interpolation='none', extent=[0, n_trials, group5.stop, group5.start])
-
-            cbar = plt.colorbar(im, ax=ax, orientation='horizontal', pad=0.1, fraction=0.05, shrink=0.3)
-            cbar.set_ticks([0, 1])
-            cbar.set_label('Feature value', fontsize=6, labelpad=-0.5)
-            cbar.ax.tick_params(labelsize=6)
-            ax.set_xlabel('Trials', fontsize=6)
-            ax.set_ylim(n_rows, 0)
-            ax.set_yticks(np.arange(n_rows) + 0.5)
-            ax.set_yticklabels(cols_to_plot, fontsize=4)
-            ax.tick_params(which='major', labelsize=4)
-            fig.tight_layout()
-
-            out_dir = dataset_folder / 'single_sessions'
-            out_dir.mkdir(parents=True, exist_ok=True)
-            for ext in ['pdf', 'eps']:
-                plt.savefig(out_dir / f'feature_matrix_{mouse_id}_day{day}.{ext}',
-                            bbox_inches='tight', dpi='figure')
-            plt.close(fig)
 
     return data_df
 
@@ -455,16 +346,14 @@ def create_behavior_dataset(nwb_list, mouse_info_df, n_trials_max=None, n_worker
     -------
     pd.DataFrame of all trials concatenated across sessions
     """
-    if n_workers is None:
-        n_workers = max(1, os.cpu_count() - 2)
 
+
+
+    # Args are list of NWB files
     task_args = [(nwb_file, mouse_info_df, n_trials_max) for nwb_file in nwb_list]
 
-    #with Pool(processes=n_workers) as pool:
-    #    session_results = pool.map(_process_single_session, task_args)
-    with Pool(processes=n_workers) as pool:
+    with Pool(processes=os.cpu_count() - 1) as pool:
          session_results = list(tqdm(pool.imap(_process_single_session, task_args), total=len(task_args), desc='Dataset creation:'))
-
 
 
     bhv_data = [df for df in session_results if df is not None]

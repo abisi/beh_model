@@ -154,13 +154,13 @@ if __name__ == '__main__':
                 expected_states_train = get_expected_states(glmhmm, outputs=output_train, inputs=input_train)
                 posterior_probs_train = np.concatenate(expected_states_train, axis=0)
                 pred_labels_train = get_predicted_labels(glmhmm, inputs=input_train, posteriors=posterior_probs_train)
-                pred_acc_train = calculate_predictive_accuracy(output_train, pred_labels_train)
+                pred_acc_train, balanced_pred_acc_train = calculate_predictive_accuracy(output_train, pred_labels_train)
 
                 # Test data
                 expected_states_test = get_expected_states(glmhmm, outputs=output_test, inputs=input_test)
                 posterior_probs_test = np.concatenate(expected_states_test, axis=0)
                 pred_labels_test = get_predicted_labels(glmhmm, inputs=input_test, posteriors=posterior_probs_test)
-                pred_acc_test = calculate_predictive_accuracy(output_test, pred_labels_test)
+                pred_acc_test, balanced_pred_acc_test = calculate_predictive_accuracy(output_test, pred_labels_test)
 
                 logger.info('Predictive accuracy on train data: {}'.format(pred_acc_train))
                 logger.info('Predictive accuracy on test data: {}'.format(pred_acc_test))

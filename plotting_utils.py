@@ -168,6 +168,36 @@ def plot_feature_matrix(feature_matrix, feature_names, title, save_path, file_na
     save_figure_to_files(fig, save_path, file_name, suffix=suffix, file_types=file_types)
     return
 
+def save_figure_with_options(figure, file_formats, filename, output_dir='', dark_background=False):
+    """
+    Save a Matplotlib figure in multiple file formats with options for dark background.
+    :param figure: Figure object
+    :param file_formats: list of file formats (e.g., ['png', 'pdf'])
+    :param filename: filename without extension
+    :param output_dir: directory to save figure
+    :param dark_background: whether to change basic colors for dark background
+    :return:
+    """
+    # Make transparent for dark background
+    if dark_background:
+        figure.patch.set_alpha(0)
+        figure.set_facecolor('#f4f4ec')
+        for ax in figure.get_axes():
+            ax.set_facecolor('#f4f4ec')
+        #plt.rcParams.update({'axes.facecolor': '#f4f4ec',  # very pale beige
+        #                        'figure.facecolor': '#f4f4ec'})
+        transparent = True
+        filename = filename + '_transparent'
+    else:
+        transparent = False
+
+    # Save the figure in each specified file format
+    for file_format in file_formats:
+        file_path = os.path.join(output_dir, f"{filename}.{file_format}")
+        figure.savefig(file_path, transparent=transparent, bbox_inches='tight', dpi='figure')
+
+    return
+
 def plot_model_glm_weights(model, init_weights, feature_names, save_path, file_name, suffix=None, file_types=None):
     """
     Plot GLM weights.
@@ -277,7 +307,7 @@ def plot_single_session_predictions(data, save_path, file_name, suffix=None, fil
 
     for session_id in data['session_id'].unique():
 
-        fig, ax = plt.subplots(1, 1, figsize=(10, 5), dpi=300, facecolor='w', edgecolor='k')
+        fig, ax = plt.subplots(1, 1, figsize=(5, 2.5), dpi=300, facecolor='w', edgecolor='k')
         remove_top_right_frame(ax)
 
         sess_data = data[data['session_id'] == session_id]
@@ -286,23 +316,30 @@ def plot_single_session_predictions(data, save_path, file_name, suffix=None, fil
         true_labels = sess_data['choice'].values
         predicted_labels = sess_data['pred'].values
 
-        ax.scatter(range(n_trials), true_labels, c='k', edgecolors=None, alpha=0.7, s=10, marker='o', label='Data')
-        ax.scatter(range(n_trials), predicted_labels, c='r', alpha=0.7, s=10, marker='x', label='Model')
-        ax.set_ylabel('Choice', fontsize=15)
-        ax.set_xlabel('Trials', fontsize=15)
-        ax.set_yticks([0, 1], ['No lick', 'Lick'], fontsize=12)
+        def compress_binary(x, low=0.1, high=0.9):
+            return x * (high - low) + low
+
+        true_plot = compress_binary(true_labels)
+        pred_plot = compress_binary(predicted_labels)
+
+        ax.scatter(range(n_trials), true_plot, c='k', edgecolors=None, alpha=0.7, s=10, marker='o', label='Data')
+        ax.scatter(range(n_trials), pred_plot, c='r', alpha=0.7, s=10, marker='x', label='Model')
+        ax.set_ylabel('Choice', fontsize=12)
+        ax.set_xlabel('Trials', fontsize=12)
+        ax.set_yticks([0.1, 0.9], ['No lick', 'Lick'], fontsize=12)
+        ax.set_ylim(0, 1)
 
         ax.legend(frameon=False, loc='center right')
         rew_group = sess_data['reward_group'].values[0]
         title = 'Predictions for {} - {}'.format(session_id, rew_group_map[rew_group])
-        fig.suptitle(title, fontsize=15)
+        fig.suptitle(title, fontsize=12)
 
 
         save_figure_to_files(fig, save_path, file_name+'_{}'.format(session_id), suffix=suffix, file_types=file_types)
         plt.close()
     return
 
-def plot_single_session_posterior_states(data, save_path, file_name, suffix=None, file_types=None):
+def plot_single_session_posterior_states(data, save_path, file_name, suffix=None, file_types=None): #too: plot comparison with Viterbi
     """
     Plot single session posterior states
     :param data: pd.DataFrame with session data
@@ -313,6 +350,9 @@ def plot_single_session_posterior_states(data, save_path, file_name, suffix=None
 
     :return:
     """
+    # Create a cmap to map state indices to colors so that it's reusable
+    state_index_cmap = {0:'#157BE9', 1:'#E9157B', 2:'#7BE915', 3: '#c5d642', 4:'#c5d642', 5:'#329fd1', 6:'#d642aa'}  # Example mapping, adjust as needed
+
     if not os.path.exists(save_path):
         os.makedirs(save_path)
 
@@ -322,28 +362,88 @@ def plot_single_session_posterior_states(data, save_path, file_name, suffix=None
 
     for session_id in data['session_id'].unique():
 
-        fig, axs = plt.subplots(2, 1, figsize=(30, 5), dpi=80, facecolor='w', edgecolor='k',
-                                gridspec_kw={'height_ratios': [10, 1]}, sharex=True)
+        fig, axs = plt.subplots(2, 1, figsize=(6, 3), dpi=400, facecolor='w', edgecolor='k',
+                                gridspec_kw={'height_ratios': [12, 1]}, sharex=True)
         remove_top_right_frame(axs[0])
 
         sess_data = data[data['session_id'] == session_id]
 
         for idx, state_col in enumerate(posterior_cols):
-            axs[0].plot(sess_data[state_col].values, label="State " + str(idx + 1), lw=2)
+            state_color = state_index_cmap[idx]  # Get color for this state index
+            post_data = sess_data[state_col].values
+            axs[0].plot(post_data, label="state " + str(idx + 1), lw=1.5, color=state_color)
+
+            #Plot the same but smoother e.g. 5 trials smoothing
+            window_size = 3
+            post_smooth = np.convolve(sess_data[state_col].values, np.ones(window_size)/window_size, mode='same')
+            #axs[0].plot(post_smooth, lw=1, linestyle='--', color=state_color)
+
+        # Assign single-trial to most likely state #TODO: make it a function
+        most_likely_state = np.argmax(sess_data[posterior_cols].values, axis=1)
+
+        # If both states are 0.5, assign the previous state as most likely state to avoid too much noise in the plot
+        for idx in range(1, len(most_likely_state)-1):
+            if np.isclose(sess_data[posterior_cols].values[idx], 0.5).all():
+                most_likely_state[idx] = most_likely_state[idx-1]
+
+        # If states are only one trial long, merge them to the next state to avoid too much noise in the plot
+        for idx in range(1, len(most_likely_state)-1):
+            if most_likely_state[idx] != most_likely_state[idx-1] and most_likely_state[idx] != most_likely_state[idx+1]:
+                most_likely_state[idx] = most_likely_state[idx+1]
+
+        # Plot most likely state as a shaded background
+        x = np.arange(len(sess_data))
+
+        for idx in range(len(posterior_cols)):
+            state_color = state_index_cmap[idx]
+            mask = most_likely_state == idx
+
+            start = None
+            for i, m in enumerate(mask):
+                if m and start is None:
+                    start = i
+                #elif not m and start is not None:
+                #    axs[0].axvspan(start,i, ymin=0,ymax=0.5, color=state_color, alpha=0.1)
+                #    start = None
+
+            #if start is not None:
+            #    axs[0].axvspan(start, len(mask), color=state_color, alpha=0.1)
+
+        # --- Use Viterbi as most likely state for shading ---
+        most_likely_state = sess_data["most_likely_state"].values  # already Viterbi
+        x = np.arange(len(sess_data))
+
+        for idx in range(len(posterior_cols)):
+            state_color = state_index_cmap[idx]
+            mask = most_likely_state == idx
+
+            start = None
+            for i, m in enumerate(mask):
+                if m and start is None:
+                    start = i
+                elif not m and start is not None:
+                    axs[0].axvspan(start, i, ymin=0.0,ymax=1.0,color=state_color, alpha=0.1)
+                    start = None
+            if start is not None:
+                axs[0].axvspan(start, len(mask), color=state_color, alpha=0.1)
 
         axs[0].set_ylim((-0.01, 1.01))
-        axs[0].set_xlabel("Trials", fontsize=15)
-        axs[0].set_ylabel("P(state)", fontsize=15)
-        axs[0].legend(frameon=False, loc="upper right", fontsize=12)
+        #axs[0].set_xlabel("Trials", fontsize=10)
+        axs[0].set_ylabel("P(state)", fontsize=10)
+        legend = axs[0].legend(frameon=True, loc="center right", fontsize=6)
+        legend.get_frame().set_facecolor('white')
+        legend.get_frame().set_alpha(0.5)
+        legend.get_frame().set_edgecolor("none")
+
 
         # Plot corresponding trial outcome
-        sess_data['trial_type'] = np.nan  # TODO: check if this works
-        sess_data.loc[(sess_data.stimulus_type == -1) & (sess_data.choice == 1), 'trial_type'] = 'ah'
-        sess_data.loc[(sess_data.stimulus_type == -1) & (sess_data.choice == 0), 'trial_type'] = 'am'
-        sess_data.loc[(sess_data.stimulus_type == 1) & (sess_data.choice == 1), 'trial_type'] = 'wh'
-        sess_data.loc[(sess_data.stimulus_type == 1) & (sess_data.choice == 0), 'trial_type'] = 'wm'
-        sess_data.loc[(sess_data.stimulus_type == 0) & (sess_data.choice == 1), 'trial_type'] = 'fa'
-        sess_data.loc[(sess_data.stimulus_type == 0) & (sess_data.choice == 0), 'trial_type'] = 'cr'
+        sess_data['trial_type'] = np.nan
+        sess_data.loc[(sess_data.auditory == 1) & (sess_data.choice == 1), 'trial_type'] = 'ah'
+        sess_data.loc[(sess_data.auditory == 0) & (sess_data.choice == 0), 'trial_type'] = 'am'
+        sess_data.loc[(sess_data.whisker == 1) & (sess_data.choice == 1), 'trial_type'] = 'wh'
+        sess_data.loc[(sess_data.whisker == 1) & (sess_data.choice == 0), 'trial_type'] = 'wm'
+        sess_data.loc[(sess_data.auditory == 0) & (sess_data.whisker == 0) & (sess_data.choice == 1), 'trial_type'] = 'fa'
+        sess_data.loc[(sess_data.auditory == 0) & (sess_data.whisker == 0) & (sess_data.choice == 0), 'trial_type'] = 'cr'
 
         perf_map = {0: 'wm', 2: 'wh', 1: 'am', 3: 'ah', 4: 'cr', 5: 'fa'}
         perf_map = {v: k for k, v in perf_map.items()}
@@ -362,6 +462,19 @@ def plot_single_session_posterior_states(data, save_path, file_name, suffix=None
         norm = colors.BoundaryNorm(bounds, cmap.N)
         axs[1].pcolor(np.expand_dims(sess_data['perf'].values, axis=0), cmap=cmap, norm=norm,
                       edgecolors=None, linewidths=0)
+        axs[1].set_xlabel("Trials", fontsize=10)
+        # Remove all spines but the bottom one
+        axs[1].spines['top'].set_visible(False)
+        axs[1].spines['right'].set_visible(False)
+        axs[1].spines['left'].set_visible(False)
+        # Remove y ticks and labels
+        axs[1].set_yticks([])
+        axs[1].set_yticklabels([])
+        # Keep x tickss
+
+
+        # Reduce space between subplots
+        plt.subplots_adjust(hspace=0.04)
 
         save_figure_to_files(fig, save_path, file_name+'_{}'.format(session_id), suffix=suffix, file_types=file_types)
         plt.close()
@@ -369,3 +482,76 @@ def plot_single_session_posterior_states(data, save_path, file_name, suffix=None
 
 
 
+def _annotate_feature_stats(ax, data, feats, rg_order, y_pad_frac=0.04):
+    """
+    For each feature position on the x-axis, run a between-group statistical
+    test and draw a significance annotation above the data.
+
+    Two groups  → Mann-Whitney U (two-sided).
+    Three+ groups → Kruskal-Wallis.
+
+    P-values are Bonferroni-corrected for the number of features tested.
+    Significance stars: ns p≥0.05 | * p<0.05 | ** p<0.01 | *** p<0.001
+    """
+    from scipy.stats import mannwhitneyu, kruskal
+
+    def _stars(p):
+        if p < 0.001: return "***"
+        if p < 0.01:  return "**"
+        if p < 0.05:  return "*"
+        return "ns"
+
+    # ------------------------------------------------------------------
+    # Pass 1: compute raw p-values for every feature
+    # ------------------------------------------------------------------
+    raw_pvalues = {}   # feat → p
+    for feat in feats:
+        groups = [
+            data.loc[(data["feature"] == feat) & (data["reward_group"] == rg), "weight"].dropna().values
+            for rg in rg_order
+        ]
+        groups = [g for g in groups if len(g) >= 2]
+        if len(groups) < 2:
+            continue
+        try:
+            print('WEIGHT STAT TEST DATAPOINTS', len(groups[0]), len(groups[1]))
+            _, p = mannwhitneyu(groups[0], groups[1], alternative="two-sided")
+            raw_pvalues[feat] = p
+        except ValueError:
+            continue
+
+    if not raw_pvalues:
+        return
+
+    # ------------------------------------------------------------------
+    # Bonferroni correction: multiply each p by the number of tests
+    # ------------------------------------------------------------------
+    n_tests = len(raw_pvalues)
+    corrected_pvalues = {
+        feat: min(p * n_tests, 1.0)
+        for feat, p in raw_pvalues.items()
+    }
+
+    # ------------------------------------------------------------------
+    # Pass 2: annotate using corrected p-values
+    # ------------------------------------------------------------------
+    y_min, y_max = ax.get_ylim()
+    pad = (y_max - y_min) * y_pad_frac
+    new_y_max = y_max
+
+    for x_pos, feat in enumerate(feats):
+        if feat not in corrected_pvalues:
+            continue
+        p_corr = corrected_pvalues[feat]
+
+        feat_data = data[data["feature"] == feat]["weight"].dropna()
+        y_top = feat_data.max() + pad
+
+        ax.text(
+            x_pos, y_top, _stars(p_corr),
+            ha="center", va="bottom",
+            fontsize=6, color="black",
+        )
+        new_y_max = max(new_y_max, y_top + pad)
+
+    ax.set_ylim(y_min, new_y_max)

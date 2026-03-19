@@ -15,24 +15,52 @@ npr.seed(0)
 import pickle
 import matplotlib.pyplot as plt
 import ssm
-
+from pathlib import Path
+import time
 
 from data_utils import create_data_lists
 from plotting_utils import remove_top_right_frame, save_figure_to_files
+from multicollinearity_utils import check_multicollinearity, plot_multicollinearity
 
 from GLM import glm
 from glm_utils import calculate_predictive_acc_glm
-
+import config
 
 if __name__ == '__main__':
 
 
-    # Load train and test datasets
-    experimenter = 'Axel_Bisi'
-    dataset_path = os.path.join('\\\\sv-nas1.rcp.epfl.ch', 'Petersen-Lab', 'analysis', experimenter, r'beh_model\global_glm\datasets')
-    result_path = os.path.join('\\\\sv-nas1.rcp.epfl.ch', 'Petersen-Lab', 'analysis', experimenter, r'beh_model\global_glm\models')
+    start_time = time.time()
 
-    for split_idx in range(1):
+    experimenter = 'Axel_Bisi'
+    dataset_path = Path(
+        f'\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\analysis\\{experimenter}'
+        f'\\combined_results\\glm_hmm\\datasets_combined_mvt'
+    )
+    if config.TRIAL_TYPES == 'whisker_trial':
+        result_path = Path(
+            f'\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\analysis\\{experimenter}'
+            f'\\combined_results\\glm_hmm\\global_glm_mvt_whisker_trials'
+        )
+    else:
+        result_path = Path(
+            f'\\\\sv-nas1.rcp.epfl.ch\\Petersen-Lab\\analysis\\{experimenter}'
+            f'\\combined_results\\glm_hmm\\global_glm_mvt'
+        )
+    result_path.mkdir(parents=True, exist_ok=True)
+
+    N_SPLITS    = config.N_SPLITS
+    N_INSTANCES = config.N_INSTANCES
+
+    # Check multicolinearity of features
+    sample_split_path = Path(dataset_path, f'dataset_0')
+    data_train = pickle.load(open(sample_split_path / 'data_train.pkl', 'rb'))
+
+    results = check_multicollinearity(data_train, config.FEATURES)
+    plot_multicollinearity(results, save_path=os.path.join(result_path, 'multicollinearity'))
+
+
+    start_time = time.time()
+    for split_idx in range(N_SPLITS):
         dataset_split_path = os.path.join(dataset_path, 'dataset_{}'.format(split_idx))
         result_split_path = os.path.join(result_path, 'model_{}'.format(split_idx))
         data_train = pickle.load(open(os.path.join(dataset_split_path, 'data_train.pkl'), 'rb'))
@@ -40,29 +68,18 @@ if __name__ == '__main__':
 
 
         # Select features
-        features = ['prev_choice', 'stimulus_type', 'prev_stimulus_type',
-                        'auditory', 'prev_auditory', 'whisker', 'prev_whisker',
-                        'reward_given', 'prev_reward_given']
-        features = ['prev_choice',
-                    'stimulus_type',
-                    'prev_stimulus_type',
-                    'prev_whisker',
-                    'prev_reward_given']
-
+        features = config.FEATURES
+        print('Fitting global GLM with features: {}'.format(features))
 
         # Create design matrices, split session-wise
         input_train, output_train, input_test, output_test = create_data_lists(data_train, data_test, features=features)
-        print('input_train shape:', input_train[0].shape)
-        print('output_train shape:', output_train[0].shape)
-
 
         # Repeat for multiple instances
-        n_instances = 1
-        ll_train_arr = np.zeros(n_instances)
-        ll_test_arr = np.zeros(n_instances)
-        recovered_weights_arr = np.zeros((n_instances, len(features)))
+        ll_train_arr = np.zeros(N_INSTANCES)
+        ll_test_arr = np.zeros(N_INSTANCES)
+        recovered_weights_arr = np.zeros((N_INSTANCES, len(features)))
 
-        for i in range(n_instances):
+        for i in range(N_INSTANCES):
 
             # Folder for iteration
             results_dir_iter = os.path.join(result_split_path, 'iter_{}'.format(i))
@@ -82,11 +99,12 @@ if __name__ == '__main__':
                                  transitions="standard", verbose=5)
 
             #global_glm = glm(M=input_dim, C=num_categories)
-            #ll_train, recovered_weights = global_glm.fit_glm(datas=[output_train],inputs=[input_train], masks=None, tags=None)
+            #ll_train, recovered_weights = global_glm.fit_glm(datas=output_train,inputs=input_train, masks=None, tags=None)
 
             # Fit GLM-HMM with MLE
-            n_iters = 300  # max EM iterations (fitting will stop earlier if LL below tolerance)
-            global_glm.fit(output_train, inputs=input_train, method='em', num_iters=n_iters, tolerance=10**-4)
+            n_iters = config.HMM_PARAMS['n_train_iters']  # max EM iterations (fitting will stop earlier if LL below tolerance)
+            tol = config.HMM_PARAMS['tolerance']
+            global_glm.fit(output_train, inputs=input_train, method='em', num_iters=n_iters, tolerance=tol, verbose=5)
             ll_train = global_glm.log_likelihood(output_train, input_train, None, None)
             recovered_weights = np.squeeze(global_glm.observations.params[0])
 
@@ -128,7 +146,6 @@ if __name__ == '__main__':
             result_dict = {
                 'covariates': features,
                 'weights': recovered_weights,
-
                 'll_train': ll_train,
                'll_test': ll_test,
             }

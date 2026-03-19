@@ -668,7 +668,7 @@ def analyze_global_weights(all_models_res_df, result_figure_path, model_type='fu
     import utils
     weights_long_df, permutations = utils.align_weights_dataframe(weights_long_df, use_mean_reference=False)
 
-    # Verify alignmente by plotting the weights across splits
+    # Verify alignment by plotting the weights across splits
     debug=True
     if debug:
         # Create a subplots to plot weights for each state and split
