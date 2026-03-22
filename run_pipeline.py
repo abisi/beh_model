@@ -1461,68 +1461,87 @@ def _load_single_weights_long(cfg) -> pd.DataFrame:
     return pd.DataFrame(all_rows)
 
 def _load_single_weights_long_permut(cfg, all_perms: dict) -> pd.DataFrame:
-    """
-    Walk every single-mouse NPZ result file and return a long-form DataFrame
-    with aligned state indices, using precomputed permutations from
-    stage_find_permutations().
+    from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    :param cfg:       pipeline config dict
-    :param all_perms: {(rg, model_name, n_states, mouse_id, si, inst): inv_perm}
-                      from load_permutations()
-    :return: long-form DataFrame of aligned weights
-    """
     feature_sets = build_feature_sets(cfg["features"], cfg.get("trial_types"))
-    rows = []
+    # ── Only "full" model is used — skip the loop entirely ────────────────────
+    if "full" not in feature_sets:
+        return pd.DataFrame()
+    feats_cfg  = feature_sets["full"]
+    model_name = "full"
+
+    # ── 1. Collect all valid tasks upfront ─────────────────────────────────────
+    tasks = []  # (f, mouse_id, rg, n_states, si, inst, feats_cfg)
 
     for rg_int in cfg["reward_groups"]:
         rg = _RG_STR.get(int(rg_int), str(rg_int))
+        single_base = cfg["single_path"] / _rg_label(rg_int) / model_name
+        if not single_base.exists():
+            continue
 
-        for model_name in feature_sets:
-            if model_name != 'full':
-                continue
+        for mouse_dir in single_base.iterdir():
+            mouse_id = mouse_dir.name
+            for si in range(cfg["n_splits"]):
+                for inst in range(cfg["n_instances"]):
+                    for n_states in cfg["n_states_list"]:
+                        f = (single_model_dir(cfg, mouse_id, si, n_states, inst, model_name, rg_int)
+                             / "fit_glmhmm_results.npz")
+                        if f.exists():
+                            tasks.append((f, mouse_id, rg, rg_int, n_states, si, inst))
 
-            feats_cfg = feature_sets[model_name]
+    if not tasks:
+        return pd.DataFrame()
 
-            for n_states in cfg["n_states_list"]:
-                single_base = cfg["single_path"] / _rg_label(rg_int) / model_name
-                if not single_base.exists():
-                    continue
+    # ── 2. Worker: load one NPZ → small DataFrame (no Python loops over weights)
+    def _process_one(task) -> pd.DataFrame | None:
+        f, mouse_id, rg, rg_int, n_states, si, inst, = task
+        try:
+            res = np.load(f, allow_pickle=True)["arr_0"].item()
+        except Exception as e:
+            logger.warning(f"  Could not load {f}: {e}")
+            return None
 
-                for mouse_dir in single_base.iterdir():
-                    mouse_id = mouse_dir.name
+        w     = np.array(res["weights"])                    # (K, 1, M)
+        feats = list(res.get("features", feats_cfg))
+        K, _, M = w.shape
+        w2d   = w[:, 0, :]                                  # (K, M)
 
-                    for split_idx in range(cfg["n_splits"]):
-                        for inst in range(cfg["n_instances"]):
-                            f = (single_model_dir(cfg, mouse_id, split_idx, n_states,
-                                                  inst, model_name, rg_int)
-                                 / "fit_glmhmm_results.npz")
-                            if not f.exists():
-                                continue
+        # Apply inv_perm to row order in one shot instead of per-state branching
+        inv_perm = all_perms.get((rg, model_name, n_states, mouse_id, si, inst))
+        if inv_perm is not None:
+            row_order = [int(inv_perm[s]) for s in range(K)]
+        else:
+            row_order = list(range(K))
 
-                            res   = np.load(f, allow_pickle=True)["arr_0"].item()
-                            w     = np.array(res["weights"])  # (K, 1, M)
-                            feats = list(res.get("features", feats_cfg))
+        # Build index arrays with np.repeat / np.tile — no Python loop over cells
+        state_indices = np.repeat(row_order, M)             # [s0,s0,...,s1,s1,...]
+        feature_vals  = np.tile(feats, K)                   # [f0,f1,...,f0,f1,...]
+        weight_vals   = w2d[np.arange(K)].ravel()           # flatten in row order
 
-                            inv_perm = all_perms.get(
-                                (rg, model_name, n_states, mouse_id, split_idx, inst)
-                            )
+        return pd.DataFrame({
+            "mouse_id"    : mouse_id,
+            "model_name"  : model_name,
+            "reward_group": rg,
+            "n_states"    : n_states,
+            "split_idx"   : si,
+            "instance_idx": inst,
+            "state_idx"   : state_indices,
+            "feature"     : feature_vals,
+            "weight"      : weight_vals,
+        })
 
-                            for s in range(w.shape[0]):
-                                aligned_s = int(inv_perm[s]) if inv_perm is not None else s
-                                for fi, feat in enumerate(feats):
-                                    rows.append(dict(
-                                        mouse_id=mouse_id,
-                                        model_name=model_name,
-                                        reward_group=rg,
-                                        n_states=n_states,
-                                        split_idx=split_idx,
-                                        instance_idx=inst,
-                                        state_idx=aligned_s,
-                                        feature=feat,
-                                        weight=float(w[s, 0, fi]),
-                                    ))
+    # ── 3. Parallel I/O ────────────────────────────────────────────────────────
+    max_workers = min(len(tasks), 10)
+    frames: list[pd.DataFrame] = []
 
-    return pd.DataFrame(rows)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_process_one, t): t for t in tasks}
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result is not None:
+                frames.append(result)
+
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
 def _load_single_weights_long_viterbi(cfg) -> pd.DataFrame:
@@ -1881,10 +1900,15 @@ def _load_single_trial_data_old(cfg, model_name: str, n_states: int) -> pd.DataF
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
 def _load_single_trial_data_permut(cfg, model_name: str, all_perms: dict) -> pd.DataFrame:
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     n_splits    = cfg["n_splits"]
     n_instances = cfg["n_instances"]
 
-    dfs = []
+    # ── 1. Collect all valid tasks upfront ─────────────────────────────────────
+    # Avoids building a path_map dict only to discard most of it.
+    Task = tuple  # (h5, mouse_id, rg, n_states, si, inst, post_cols_ordered)
+    tasks: list[Task] = []
 
     for n_states in cfg["n_states_list"]:
         post_cols_ordered = [f"posterior_state_{i + 1}" for i in range(n_states)]
@@ -1897,58 +1921,71 @@ def _load_single_trial_data_permut(cfg, model_name: str, all_perms: dict) -> pd.
 
             for mouse_dir in single_base.iterdir():
                 mouse_id = mouse_dir.name
+                for si in range(n_splits):
+                    for inst in range(n_instances):
+                        p  = single_model_dir(cfg, mouse_id, si, n_states, inst, model_name, rg_int)
+                        h5 = p / "data_preds.h5"
+                        if h5.exists():
+                            tasks.append((h5, mouse_id, rg, n_states, si, inst, post_cols_ordered))
 
-                path_map = {
-                    (si, inst): single_model_dir(cfg, mouse_id, si, n_states, inst, model_name, rg_int)
-                    for si   in range(n_splits)
-                    for inst in range(n_instances)
-                }
-                valid_keys = {
-                    k for k, p in path_map.items()
-                    if (p / "data_preds.h5").exists()
-                }
+    if not tasks:
+        return pd.DataFrame()
 
-                for (si, inst) in valid_keys:
-                    h5 = path_map[(si, inst)] / "data_preds.h5"
-                    try:
-                        df = pd.read_hdf(h5)
+    # ── 2. Worker: load + transform one file ───────────────────────────────────
+    def _process_one(task: Task) -> pd.DataFrame | None:
+        h5, mouse_id, rg, n_states, si, inst, post_cols_ordered = task
+        try:
+            df = pd.read_hdf(h5)
+        except Exception as e:
+            logger.warning(f"  Could not load {h5}: {e}")
+            return None
 
-                        df["mouse_id"]     = mouse_id
-                        df["reward_group"] = rg
-                        df["n_states"]     = n_states
-                        df["model_name"]   = model_name
-                        df["split_idx"]    = si
-                        df["instance_idx"] = inst
+        # Scalar metadata in one shot
+        df = df.assign(
+            mouse_id     = mouse_id,
+            reward_group = rg,
+            n_states     = n_states,
+            model_name   = model_name,
+            split_idx    = si,
+            instance_idx = inst,
+        )
 
-                        # Apply composed inv_perm from all_perms
-                        inv_perm = all_perms.get((rg, model_name, n_states, mouse_id, si, inst))
-                        if inv_perm is not None:
+        # Permutation remapping
+        inv_perm = all_perms.get((rg, model_name, n_states, mouse_id, si, inst))
+        if inv_perm is not None:
+            present = [c for c in post_cols_ordered if c in df.columns]
+            if present:
+                old_cols    = [f"posterior_state_{inv_perm[i] + 1}" for i in range(len(inv_perm))]
+                df[present] = df[old_cols].to_numpy()
+            if "most_likely_state" in df.columns:
+                df["most_likely_state"] = inv_perm[df["most_likely_state"].to_numpy()]
 
-                            # Remap posterior columns
-                            present = [c for c in post_cols_ordered if c in df.columns]
-                            if present:
-                                old_cols    = [f"posterior_state_{inv_perm[i] + 1}" for i in range(len(inv_perm))]
-                                df[present] = df[old_cols].to_numpy()
+        # Dominant state
+        if "most_likely_state" in df.columns:
+            df["dominant_state"] = df["most_likely_state"]
+        else:
+            logger.warning(
+                f"  most_likely_state not found in {h5}; falling back to posterior argmax"
+            )
+            present_post = [c for c in post_cols_ordered if c in df.columns]
+            if present_post:
+                df["dominant_state"] = df[present_post].to_numpy().argmax(axis=1)
 
-                            # Remap integer state label
-                            if "most_likely_state" in df.columns:
-                                df["most_likely_state"] = inv_perm[df["most_likely_state"].to_numpy()]
+        return df
 
-                        # Dominant state
-                        if "most_likely_state" in df.columns:
-                            df["dominant_state"] = df["most_likely_state"]
-                        else:
-                            logger.warning(
-                                f"  most_likely_state not found in {h5}; "
-                                "falling back to posterior argmax"
-                            )
-                            present_post = [c for c in post_cols_ordered if c in df.columns]
-                            if present_post:
-                                df["dominant_state"] = df[present_post].to_numpy().argmax(axis=1)
+    # ── 3. Parallel I/O ────────────────────────────────────────────────────────
+    # Threads (not processes) because HDF5 reads are I/O-bound and GIL is released
+    # during the underlying C-level disk read.  Cap workers to avoid thrashing the
+    # NAS; 8–12 is typically the sweet spot for a network-mounted share.
+    max_workers = min(len(tasks), 10)
+    dfs: list[pd.DataFrame] = []
 
-                        dfs.append(df)
-                    except Exception as e:
-                        logger.warning(f"  Could not load {h5}: {e}")
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {pool.submit(_process_one, t): t for t in tasks}
+        for fut in as_completed(futures):
+            result = fut.result()
+            if result is not None:
+                dfs.append(result)
 
     return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
 
@@ -2931,70 +2968,69 @@ def _draw_posterior_panel_single_mouse(
     return len(mice)
 
 
-ef
-_draw_posterior_panel_interpolated(ax, sub, post_cols, state_colors, n_grid=100):
-"""
-Interpolate each session's posteriors to a normalised [0, 1] grid,
-average within-mouse, then plot grand mean ± SEM across mice.
+def _draw_posterior_panel_interpolated(ax, sub, post_cols, state_colors, n_grid=100):
+    """
+    Interpolate each session's posteriors to a normalised [0, 1] grid,
+    average within-mouse, then plot grand mean ± SEM across mice.
 
-Grouping key: (mouse_id, session_id, split_idx, instance_idx) so that
-each unique fitting instance × session contributes one curve.
+    Grouping key: (mouse_id, session_id, split_idx, instance_idx) so that
+    each unique fitting instance × session contributes one curve.
 
-Returns the number of mice contributing.
-"""
-x_grid = np.linspace(0, 1, n_grid)
+    Returns the number of mice contributing.
+    """
+    x_grid = np.linspace(0, 1, n_grid)
 
-# Build the grouping key from whichever columns are present
-group_keys = ["mouse_id", "session_id"]
-for col in ("split_idx", "instance_idx"):
-    if col in sub.columns:
-        group_keys.append(col)
+    # Build the grouping key from whichever columns are present
+    group_keys = ["mouse_id", "session_id"]
+    for col in ("split_idx", "instance_idx"):
+        if col in sub.columns:
+            group_keys.append(col)
 
-mouse_curves: dict[str, list[np.ndarray]] = {}
+    mouse_curves: dict[str, list[np.ndarray]] = {}
 
-for keys, sess_df in sub.groupby(group_keys):
-    mouse_id = keys[0]  # first element is always mouse_id
-    n_trials = len(sess_df)
-    if n_trials < 2:
-        continue
+    for keys, sess_df in sub.groupby(group_keys):
+        mouse_id = keys[0]  # first element is always mouse_id
+        n_trials = len(sess_df)
+        if n_trials < 2:
+            continue
 
-    x_orig = np.linspace(0, 1, n_trials)
+        x_orig = np.linspace(0, 1, n_trials)
 
-    # Interpolate every posterior column to the common grid
-    interp_mat = np.zeros((n_grid, len(post_cols)))
+        # Interpolate every posterior column to the common grid
+        interp_mat = np.zeros((n_grid, len(post_cols)))
+        for j, col in enumerate(post_cols):
+            y = sess_df[col].to_numpy(dtype=float)
+            interp_mat[:, j] = np.interp(x_grid, x_orig, y)
+
+        mouse_curves.setdefault(mouse_id, []).append(interp_mat)
+
+    if not mouse_curves:
+        return 0
+
+    # Within-mouse average  →  (n_mice, n_grid, n_states)
+    mouse_means = np.array(
+        [np.mean(curves, axis=0) for curves in mouse_curves.values()]
+    )
+
+    grand_mean = mouse_means.mean(axis=0)  # (n_grid, n_states)
+    n_mice = len(mouse_means)
+    sem = (mouse_means.std(axis=0, ddof=1) / np.sqrt(n_mice)
+           if n_mice > 1 else np.zeros_like(grand_mean))
+
     for j, col in enumerate(post_cols):
-        y = sess_df[col].to_numpy(dtype=float)
-        interp_mat[:, j] = np.interp(x_grid, x_orig, y)
+        color = state_colors[j]
+        ax.plot(x_grid, grand_mean[:, j],
+                color=color, lw=1.5, label=f"State {j + 1}")
+        ax.fill_between(x_grid,
+                        grand_mean[:, j] - sem[:, j],
+                        grand_mean[:, j] + sem[:, j],
+                        color=color, alpha=0.2)
 
-    mouse_curves.setdefault(mouse_id, []).append(interp_mat)
-
-if not mouse_curves:
-    return 0
-
-# Within-mouse average  →  (n_mice, n_grid, n_states)
-mouse_means = np.array(
-    [np.mean(curves, axis=0) for curves in mouse_curves.values()]
-)
-
-grand_mean = mouse_means.mean(axis=0)  # (n_grid, n_states)
-n_mice = len(mouse_means)
-sem = (mouse_means.std(axis=0, ddof=1) / np.sqrt(n_mice)
-       if n_mice > 1 else np.zeros_like(grand_mean))
-
-for j, col in enumerate(post_cols):
-    color = state_colors[j]
-    ax.plot(x_grid, grand_mean[:, j],
-            color=color, lw=1.5, label=f"State {j + 1}")
-    ax.fill_between(x_grid,
-                    grand_mean[:, j] - sem[:, j],
-                    grand_mean[:, j] + sem[:, j],
-                    color=color, alpha=0.2)
-
-ax.set_xlim(0, 1)
-ax.set_ylim(-0.01, 1.01)
-ax.set_ylabel("P(state)", fontsize=9)
-ax.legend(frameon=False, fontsize=8)
-return n_mice
+    ax.set_xlim(0, 1)
+    ax.set_ylim(-0.01, 1.01)
+    ax.set_ylabel("P(state)", fontsize=9)
+    ax.legend(frameon=False, fontsize=8)
+    return n_mice
 
 
 def plot_posterior_curves_by_day(cfg, figure_path: Path, trial_df: pd.DataFrame, model_name: str = "full",
@@ -4749,11 +4785,11 @@ def plot_weight_metric_correlation(cfg, trial_df, weight_df, figure_path,
     For every feature in the model, correlate the per-mouse GLM-HMM weight
     difference (state high - state low) with performance metrics:
       - occupancy in high-performance state
-      - whisker hit rate and FA rate on a given day
+      - whisker hit rate on a given day
       - first low→high transition in the Viterbi state sequence
       - inflection trial (optional, provided externally)
 
-    One figure (1 row × n_metrics columns) is saved per feature.
+    One figure (1 row × n_metrics columns) is saved per (feature, reward_group).
 
     Parameters
     ----------
@@ -4761,79 +4797,28 @@ def plot_weight_metric_correlation(cfg, trial_df, weight_df, figure_path,
             'features'   : list[str], features to iterate over
             'high_state' : int, index of high-performance state (default 1)
             'low_state'  : int, index of low-performance state  (default 0)
-            'day_val'    : int, day index for hit/FA rate       (default 0)
-    trial_df      : trial-level DataFrame, pre-filtered to K=2 R+ mice, states
-                    permuted; columns: mouse_id, day, trial_id,
+            'day_val'    : int, day index for hit rate           (default 0)
+    trial_df      : trial-level DataFrame, pre-filtered to K=2 mice, states
+                    permuted; columns: mouse_id, reward_group, day, trial_id,
                     most_likely_state, choice, stimulus_type
     weight_df     : long-format weight DataFrame, same mouse subset;
-                    columns: mouse_id, feature, state, weight
+                    columns: mouse_id, reward_group, feature, state_idx, weight
     figure_path   : str or Path, directory for figure output
     inflection_df : optional DataFrame with columns ['mouse_id', 'inflection_trial']
     """
     from plotting_utils import remove_top_right_frame, save_figure_to_files
     from scipy import stats
 
-    out_base    = figure_path / "correlations"
-
+    out_base   = figure_path / "correlations"
     high_state = cfg.get('high_state', 1)
     low_state  = cfg.get('low_state',  0)
     day_val    = cfg.get('day_val',    0)
     features   = cfg.get('features',  weight_df['feature'].unique().tolist())
 
     # ------------------------------------------------------------------
-    # 1. Compute performance metrics once — independent of feature
-    # ------------------------------------------------------------------
-    mouse_ids = weight_df['mouse_id'].unique()
-
-    # Occupancy in high-performance state
-    occ = (trial_df
-           .groupby('mouse_id')['most_likely_state']
-           .apply(lambda x: (x == high_state).mean())
-           .rename('occupancy')
-           .reindex(mouse_ids))
-
-    # Whisker hit rate and FA rate on day_val
-    d0     = trial_df[trial_df['day'] == day_val]
-    wh_hit = (d0.groupby('mouse_id')['choice'].mean()
-              .rename('wh_hit')
-              .reindex(mouse_ids))
-    fa = np.nan
-
-    # First low→high transition in Viterbi sequence
-    def _first_transition(grp):
-        seq = grp.sort_values(['day', 'trial_id'])['most_likely_state'].values
-        for i in range(len(seq) - 1):
-            if seq[i] == low_state and seq[i + 1] == high_state:
-                return i + 1
-        return np.nan
-
-    first_trans = (trial_df
-                   .groupby('mouse_id')
-                   .apply(_first_transition)
-                   .rename('first_transition')
-                   .reindex(mouse_ids))
-
-    # Inflection trial (external)
-    if inflection_df is not None:
-        infl = (inflection_df
-                .set_index('mouse_id')['inflection_trial']
-                .reindex(mouse_ids))
-    else:
-        infl = pd.Series(np.nan, index=mouse_ids, name='inflection_trial')
-
-    plot_pairs = [
-        (f'State {high_state} occupancy',              occ),
-        (f'Wh hit rate (day {day_val})',               wh_hit),
-        (f'FA rate (day {day_val})',                    fa),
-        (f'First {low_state}→{high_state} transition', first_trans),
-        ('Inflection trial',                            infl),
-    ]
-    n_metrics = len(plot_pairs)
-
-    # ------------------------------------------------------------------
     # 2. Scatter helper
     # ------------------------------------------------------------------
-    def _scatter(ax, x, y, xlabel, ylabel):
+    def _scatter(ax, x, y, xlabel, ylabel, color='steelblue'):
         mask   = x.notna() & y.notna()
         xi, yi = x[mask].values.astype(float), y[mask].values.astype(float)
         if len(xi) < 3:
@@ -4842,7 +4827,7 @@ def plot_weight_metric_correlation(cfg, trial_df, weight_df, figure_path,
             ax.set_ylabel(ylabel, fontsize=9)
             remove_top_right_frame(ax)
             return
-        ax.scatter(xi, yi, s=40, color='steelblue', edgecolors='k',
+        ax.scatter(xi, yi, s=40, color=color, edgecolors='k',
                    linewidths=0.5, alpha=0.85)
         xr = np.linspace(xi.min(), xi.max(), 200)
         ax.plot(xr, np.polyval(np.polyfit(xi, yi, 1), xr), 'k--', lw=1)
@@ -4854,65 +4839,141 @@ def plot_weight_metric_correlation(cfg, trial_df, weight_df, figure_path,
         remove_top_right_frame(ax)
 
     # ------------------------------------------------------------------
-    # 3. Loop over features
+    # 3. Iterate over reward groups, then features
     # ------------------------------------------------------------------
+    reward_groups = sorted(trial_df['reward_group'].unique())
+    rg_colors     = {'R+': 'steelblue', 'R-': 'tomato'}   # extend as needed
+
     print('=== Spearman correlations ===')
 
-    for feature in features:
-        # Weight difference: high_state - low_state, mean across splits
-        feat_df = weight_df[weight_df['feature'] == feature]
-        if feat_df.empty:
-            logger.warning(f"  No weight data for feature '{feature}', skipping.")
+    for rg in reward_groups:
+
+        rg_color   = rg_colors.get(rg, 'steelblue')
+        rg_trial   = trial_df[trial_df['reward_group'] == rg]
+        rg_weight  = weight_df[weight_df['reward_group'] == rg]
+        mouse_ids  = rg_weight['mouse_id'].unique()
+
+        if len(mouse_ids) == 0:
+            logger.warning(f"  No mice for reward_group='{rg}', skipping.")
             continue
 
-        piv = (feat_df
-               .groupby(['mouse_id', 'state_idx'])['weight']
-               .mean()
-               .unstack('state_idx'))
+        # --------------------------------------------------------------
+        # 1. Compute performance metrics — once per reward group
+        # --------------------------------------------------------------
 
-        if high_state not in piv.columns or low_state not in piv.columns:
-            logger.warning(
-                f"  States {low_state}/{high_state} not both present for "
-                f"feature '{feature}', skipping."
-            )
-            continue
+        # Occupancy in high-performance state
+        occ = (rg_trial
+               .groupby('mouse_id')['most_likely_state']
+               .apply(lambda x: (x == high_state).mean())
+               .rename('occupancy')
+               .reindex(mouse_ids))
 
-        wd = (piv[high_state] - piv[low_state]).rename('weight_diff').reindex(mouse_ids)
+        # Whisker hit rate on day_val (whisker trials only)
+        d0     = rg_trial[(rg_trial['day'] == day_val)]
+        wh_hit = (d0.groupby('mouse_id')['choice']
+                  .mean()
+                  .rename('wh_hit')
+                  .reindex(mouse_ids))
 
-        # Console report
-        print(f'\n  Feature: {feature}')
-        for ylabel, y in plot_pairs:
-            mask = wd.notna() & y.notna()
-            if mask.sum() < 3:
-                print(f'    {"weight_diff":30s} vs  {ylabel:35s}:  insufficient data (n={mask.sum()})')
+        # First low→high transition in the Viterbi sequence
+        def _first_transition(grp):
+            seq = grp.sort_values(['day', 'trial_id'])['most_likely_state'].values
+            for i in range(len(seq) - 1):
+                if seq[i] == low_state and seq[i + 1] == high_state:
+                    return i + 1
+            return np.nan
+
+        first_trans = (rg_trial
+                       .groupby('mouse_id')
+                       .apply(_first_transition)
+                       .rename('first_transition')
+                       .reindex(mouse_ids))
+
+        # Inflection trial (external)
+        if inflection_df is not None:
+            infl = (inflection_df
+                    .set_index('mouse_id')['inflection_trial']
+                    .reindex(mouse_ids))
+        else:
+            infl = pd.Series(np.nan, index=mouse_ids, name='inflection_trial')
+
+        plot_pairs = [
+            (f'State {high_state} occupancy',              occ),
+            (f'Wh hit rate (day {day_val})',               wh_hit),
+            (f'First {low_state}→{high_state} transition', first_trans),
+            ('Inflection trial',                            infl),
+        ]
+        n_metrics = len(plot_pairs)
+
+        print(f'\n── Reward group: {rg}  (n={len(mouse_ids)} mice) ──')
+
+        # --------------------------------------------------------------
+        # 4. Loop over features
+        # --------------------------------------------------------------
+        for feature in features:
+
+            feat_df = rg_weight[rg_weight['feature'] == feature]
+            if feat_df.empty:
+                logger.warning(
+                    f"  [{rg}] No weight data for feature '{feature}', skipping."
+                )
                 continue
-            r, p = stats.spearmanr(wd[mask].astype(float), y[mask].astype(float))
-            print(f'    {"weight_diff":30s} vs  {ylabel:35s}:  '
-                  f'r={r:+.3f},  p={p:.3f},  n={mask.sum()}')
 
-        # Figure
-        fig, axs = plt.subplots(
-            1, n_metrics,
-            figsize=(4 * n_metrics, 4), dpi=200,
-            constrained_layout=True,
-        )
-        axs = np.atleast_1d(axs)
-        for ax, (ylabel, y) in zip(axs, plot_pairs):
-            _scatter(ax, wd, y,
-                     xlabel=f'Δw {feature} (state {high_state} − state {low_state})',
-                     ylabel=ylabel)
+            # Weight difference: high_state − low_state, mean across splits
+            piv = (feat_df
+                   .groupby(['mouse_id', 'state_idx'])['weight']
+                   .mean()
+                   .unstack('state_idx'))
 
-        fig.suptitle(
-            f'Δw {feature} (state {high_state} − state {low_state})  '
-            f'vs. performance metrics',
-            fontsize=11,
-        )
-        save_figure_to_files(
-            fig, out_base,
-            f'weight_diff_correlations_{feature}',
-            file_types=['pdf', 'eps'], dpi=250,
-        )
-        plt.close(fig)
+            if high_state not in piv.columns or low_state not in piv.columns:
+                logger.warning(
+                    f"  [{rg}] States {low_state}/{high_state} not both present "
+                    f"for feature '{feature}', skipping."
+                )
+                continue
+
+            wd = (piv[high_state] - piv[low_state]).rename('weight_diff').reindex(mouse_ids)
+
+            # Console report
+            print(f'\n  Feature: {feature}')
+            for ylabel, y in plot_pairs:
+                mask = wd.notna() & y.notna()
+                if mask.sum() < 3:
+                    print(f'    {"weight_diff":30s} vs  {ylabel:35s}:  '
+                          f'insufficient data (n={mask.sum()})')
+                    continue
+                r, p = stats.spearmanr(wd[mask].astype(float), y[mask].astype(float))
+                print(f'    {"weight_diff":30s} vs  {ylabel:35s}:  '
+                      f'r={r:+.3f},  p={p:.3f},  n={mask.sum()}')
+
+            # Figure
+            fig, axs = plt.subplots(
+                1, n_metrics,
+                figsize=(4 * n_metrics, 4), dpi=200,
+                constrained_layout=True,
+            )
+            axs = np.atleast_1d(axs)
+
+            for ax, (ylabel, y) in zip(axs, plot_pairs):
+                _scatter(ax, wd, y,
+                         xlabel=f'Δw {feature} (state {high_state} − state {low_state})',
+                         ylabel=ylabel,
+                         color=rg_color)
+
+            fig.suptitle(
+                f'{rg}  |  Δw {feature} (state {high_state} − state {low_state})'
+                f'  vs. performance metrics',
+                fontsize=11,
+            )
+
+            rg_out = out_base / rg
+            rg_out.mkdir(parents=True, exist_ok=True)
+            save_figure_to_files(
+                fig, rg_out,
+                f'weight_diff_correlations_{feature}',
+                file_types=['pdf', 'eps'], dpi=250,
+            )
+            plt.close(fig)
 
     logger.info(f"  plot_weight_metric_correlation → {figure_path}")
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5391,6 +5452,398 @@ def stage_find_permutations(cfg, cross_mouse_method: str = "weights") -> None:
 
     logger.info(f"stage_find_permutations done — {len(all_perms)} entries saved to {perm_path}")
 
+
+def list_dlc_bodyparts(nwb_file: str | Path) -> list[str]:
+    """
+    Open one NWB file and return all DLC bodypart names available under
+    processing['behavior']['BehavioralTimeSeries'].
+
+    Parameters
+    ----------
+    nwb_file : path to an NWB file
+
+    Returns
+    -------
+    Sorted list of bodypart name strings,
+    e.g. ['jaw_distance', 'nose_distance', 'pupil_area', 'whisker_angle']
+    """
+    from pynwb import NWBHDF5IO
+
+    with NWBHDF5IO(str(nwb_file), 'r', load_namespaces=True) as io:
+        nwb = io.read()
+        beh = nwb.processing.get('behavior')
+        if beh is None:
+            raise KeyError("No 'behavior' processing module found in NWB file.")
+
+        bts = beh.data_interfaces.get('BehavioralTimeSeries')
+        if bts is None:
+            raise KeyError(
+                "No 'BehavioralTimeSeries' found under processing['behavior']."
+            )
+
+        bodyparts = sorted(bts.time_series.keys())
+        logger.info(f"  Available DLC bodyparts: {bodyparts}")
+        return bodyparts
+
+
+def _get_dlc_timeseries(nwb) -> dict[str, object]:
+    """
+    Return {bodypart_name: TimeSeries} from an open NWB object via
+    processing['behavior']['BehavioralTimeSeries'].
+    Returns an empty dict if the interface is absent.
+    """
+    beh = nwb.processing.get('behavior')
+    if beh is None:
+        return {}
+    bts = beh.data_interfaces.get('BehavioralTimeSeries')
+    if bts is None:
+        return {}
+    return dict(bts.time_series)
+
+
+def _extract_window(ts_data: np.ndarray,
+                    ts_timestamps: np.ndarray,
+                    start_time: float,
+                    pre_time: float,
+                    post_time: float,
+                    n_samples: int) -> np.ndarray | None:
+    """
+    Extract a fixed-length window from a 1-D timeseries aligned to start_time.
+
+    The raw segment is resampled to exactly n_samples points via np.interp so
+    that all trials stack cleanly into a (n_trials, n_samples) matrix regardless
+    of camera frame-rate variation across sessions.
+
+    Parameters
+    ----------
+    ts_data       : 1-D float array of DLC values
+    ts_timestamps : 1-D float array, same time base as start_time
+    start_time    : alignment event time (seconds)
+    pre_time      : seconds before start_time to include (positive number)
+    post_time     : seconds after  start_time to include
+    n_samples     : number of output samples
+
+    Returns
+    -------
+    1-D array of length n_samples, or None if the window falls outside the
+    recording.
+    """
+    t0 = start_time - pre_time
+    t1 = start_time + post_time
+
+    if t0 < ts_timestamps[0] or t1 > ts_timestamps[-1]:
+        return None
+
+    i0 = np.searchsorted(ts_timestamps, t0, side='left')
+    i1 = np.searchsorted(ts_timestamps, t1, side='right')
+
+    seg_t = ts_timestamps[i0:i1]
+    seg_d = ts_data[i0:i1]
+
+    if len(seg_t) < 2:
+        return None
+
+    t_uniform = np.linspace(t0, t1, n_samples)
+    return np.interp(t_uniform, seg_t, seg_d)
+
+
+def plot_dlc_traces_by_state(cfg: dict,
+                             nwb_paths: dict[str, str | Path],
+                             trial_df: pd.DataFrame,
+                             figure_path: str | Path):
+    """
+    Plot trial-type-averaged DeepLabCut traces per bodypart, split by reward
+    group and GLM-HMM state, aligned at trial start_time.
+
+    DLC data is read from processing['behavior']['BehavioralTimeSeries'] in
+    each NWB file.
+
+    Layout (one figure per bodypart)
+    ---------------------------------
+    rows  = reward groups  (e.g. R+, R-)
+    cols  = trial types    (wh, wm, ah, am, fa, cr — or a configurable subset)
+    lines = states         (one per state index, coloured by state_index_cmap)
+
+    Mean ± SEM is computed hierarchically: average within each mouse first,
+    then compute the grand mean and inter-mouse SEM.
+
+    Parameters
+    ----------
+    cfg : dict with keys:
+        'pre_time'    : float, seconds before start_time (default 0.5)
+        'post_time'   : float, seconds after  start_time (default 1.5)
+        'n_samples'   : int,   samples per window after resampling (default 200)
+        'trial_types' : list[str], subset of
+                        ['wh','wm','ah','am','fa','cr'] (default: all six)
+        'bodyparts'   : list[str] or None — None → discovered at runtime from
+                        the first matching NWB file
+        'day_val'     : int or None — restrict to a single training day
+
+    nwb_paths : dict  {session_id: path_to_nwb_file}
+                Keys must match the 'session_id' column in trial_df.
+
+    trial_df  : trial-level DataFrame with columns:
+                  mouse_id, session_id, day, trial_id, start_time,
+                  stimulus_type, choice, most_likely_state, reward_group
+
+    figure_path : root directory for figure output
+    """
+    from pynwb import NWBHDF5IO
+    from plotting_utils import remove_top_right_frame, save_figure_to_files
+
+    figure_path = Path(figure_path)
+    out_base = figure_path / "dlc_traces_by_state"
+
+    # ── cfg defaults ──────────────────────────────────────────────────
+    pre_time = cfg.get('pre_time', 0.5)
+    post_time = cfg.get('post_time', 1.5)
+    n_samples = cfg.get('n_samples', 200)
+    day_val = cfg.get('day_val', None)
+
+    all_trial_types = ['wh', 'wm', 'ah', 'am', 'fa', 'cr']
+    trial_types_req = cfg.get('trial_types', all_trial_types)
+    trial_types_req = [t for t in all_trial_types if t in trial_types_req]  # preserve order
+
+    tt_encode = {
+        (1, 1): 'wh',
+        (1, 0): 'wm',
+        (-1, 1): 'ah',
+        (-1, 0): 'am',
+        (0, 1): 'fa',
+        (0, 0): 'cr',
+    }
+    tt_label = {
+        'wh': 'Whisker hit',
+        'wm': 'Whisker miss',
+        'ah': 'Auditory hit',
+        'am': 'Auditory miss',
+        'fa': 'False alarm',
+        'cr': 'Correct rejection',
+    }
+
+    t_axis = np.linspace(-pre_time, post_time, n_samples)
+
+    # ── Optional day filter ───────────────────────────────────────────
+    if day_val is not None:
+        trial_df = trial_df[trial_df['day'] == day_val].copy()
+        if trial_df.empty:
+            logger.warning(f"  plot_dlc_traces_by_state: no trials for day={day_val}.")
+            return
+
+    # ── Discover bodyparts from the first available NWB file ──────────
+    bodyparts_req = cfg.get('bodyparts', None)
+    if bodyparts_req is None:
+        available_sessions = [s for s in trial_df['session_id'].unique()
+                              if s in nwb_paths]
+        if not available_sessions:
+            logger.error("  plot_dlc_traces_by_state: no matching NWB paths found.")
+            return
+        bodyparts_req = list_dlc_bodyparts(nwb_paths[available_sessions[0]])
+
+    if not bodyparts_req:
+        logger.error("  plot_dlc_traces_by_state: no bodyparts found, aborting.")
+        return
+
+    logger.info(f"  Bodyparts to process: {bodyparts_req}")
+
+    # ── Annotate trial_df with trial-type label ───────────────────────
+    trial_df = trial_df.copy()
+    trial_df['trial_type'] = trial_df.apply(
+        lambda r: tt_encode.get((int(r['stimulus_type']), int(r['choice'])), 'unknown'),
+        axis=1,
+    )
+    trial_df = trial_df[trial_df['trial_type'].isin(trial_types_req)]
+
+    # ── Extraction loop — one NWB file at a time ──────────────────────
+    records = []
+
+    sessions_in_df = trial_df['session_id'].unique()
+    sessions_with_nwb = [s for s in sessions_in_df if s in nwb_paths]
+    n_missing = len(sessions_in_df) - len(sessions_with_nwb)
+    if n_missing:
+        logger.warning(f"  {n_missing} sessions in trial_df have no NWB path — skipped.")
+
+    for session_id in sessions_with_nwb:
+        sess_trials = trial_df[trial_df['session_id'] == session_id]
+        if sess_trials.empty:
+            continue
+
+        nwb_file = nwb_paths[session_id]
+        logger.info(f"  Loading DLC from {Path(nwb_file).name} "
+                    f"({len(sess_trials)} trials)")
+
+        try:
+            with NWBHDF5IO(str(nwb_file), 'r', load_namespaces=True) as io:
+                nwb = io.read()
+                ts_dict = _get_dlc_timeseries(nwb)
+
+                if not ts_dict:
+                    logger.warning(
+                        f"  No BehavioralTimeSeries in {Path(nwb_file).name}, skipping."
+                    )
+                    continue
+
+                # Filter to requested bodyparts present in this file
+                bodyparts_this = [b for b in bodyparts_req if b in ts_dict]
+                missing_bp = [b for b in bodyparts_req if b not in ts_dict]
+                if missing_bp:
+                    logger.warning(
+                        f"  Bodyparts absent from {Path(nwb_file).name}: {missing_bp}"
+                    )
+
+                # Load each bodypart's data array + timestamps once per file
+                bp_arrays: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+                for bp in bodyparts_this:
+                    ts_obj = ts_dict[bp]
+                    raw = np.array(ts_obj.data[:]).astype(float)
+                    if raw.ndim == 2:  # (T, 2) x/y → take first column
+                        raw = raw[:, 0]
+                    if ts_obj.timestamps is not None:
+                        ts_t = np.array(ts_obj.timestamps[:])
+                    else:
+                        rate = ts_obj.rate
+                        t0_r = ts_obj.starting_time or 0.0
+                        ts_t = t0_r + np.arange(len(raw)) / rate
+                    bp_arrays[bp] = (raw, ts_t)
+
+                # Extract one window per trial per bodypart
+                for _, trial in sess_trials.iterrows():
+                    start_t = float(trial['start_time'])
+                    mouse_id = trial['mouse_id']
+                    rg = trial['reward_group']
+                    state = int(trial['most_likely_state'])
+                    ttype = trial['trial_type']
+
+                    for bp, (raw, ts_t) in bp_arrays.items():
+                        window = _extract_window(
+                            raw, ts_t, start_t, pre_time, post_time, n_samples
+                        )
+                        if window is None:
+                            continue
+                        records.append({
+                            'mouse_id': mouse_id,
+                            'session_id': session_id,
+                            'trial_id': trial['trial_id'],
+                            'reward_group': rg,
+                            'state': state,
+                            'trial_type': ttype,
+                            'bodypart': bp,
+                            'window': window,
+                        })
+
+        except Exception as e:
+            logger.error(f"  Error loading {Path(nwb_file).name}: {e}")
+            continue
+
+    if not records:
+        logger.warning("  plot_dlc_traces_by_state: no windows extracted, aborting.")
+        return
+
+    rec_df = pd.DataFrame(records)
+    logger.info(
+        f"  Extracted {len(rec_df)} trial windows across "
+        f"{rec_df['mouse_id'].nunique()} mice."
+    )
+
+    # ── Plotting ──────────────────────────────────────────────────────
+    reward_groups = sorted(rec_df['reward_group'].unique())
+    n_rows = len(reward_groups)
+    n_cols = len(trial_types_req)
+
+    max_states = int(rec_df['state'].max()) + 1
+    state_palette = sns.color_palette("tab10", max_states)
+
+    for bp in bodyparts_req:
+        bp_df = rec_df[rec_df['bodypart'] == bp]
+        if bp_df.empty:
+            logger.warning(f"  No data for bodypart '{bp}', skipping.")
+            continue
+
+        fig, axs = plt.subplots(
+            n_rows, n_cols,
+            figsize=(3.5 * n_cols, 3.0 * n_rows),
+            dpi=200,
+            constrained_layout=True,
+            sharey='row',
+        )
+        axs = np.atleast_2d(axs)
+
+        fig.suptitle(
+            f"DLC — {bp}  |  aligned at trial start  "
+            f"(n={bp_df['mouse_id'].nunique()} mice)",
+            fontsize=11,
+        )
+
+        for r_idx, rg in enumerate(reward_groups):
+            rg_df = bp_df[bp_df['reward_group'] == rg]
+            rg_states = sorted(rg_df['state'].unique())
+
+            for c_idx, ttype in enumerate(trial_types_req):
+                ax = axs[r_idx, c_idx]
+                sub_df = rg_df[rg_df['trial_type'] == ttype]
+
+                remove_top_right_frame(ax)
+                ax.axvline(0, color='k', lw=0.8, ls='--', alpha=0.4)
+                ax.axhline(0, color='k', lw=0.5, alpha=0.2)
+
+                if r_idx == 0:
+                    ax.set_title(tt_label.get(ttype, ttype), fontsize=9)
+                if c_idx == 0:
+                    ax.set_ylabel(f"{rg}\n{bp}", fontsize=9)
+                if r_idx == n_rows - 1:
+                    ax.set_xlabel("Time from trial start (s)", fontsize=8)
+
+                if sub_df.empty:
+                    ax.text(0.5, 0.5, 'no trials', transform=ax.transAxes,
+                            ha='center', va='center', fontsize=8, color='grey')
+                    continue
+
+                for state in rg_states:
+                    state_df = sub_df[sub_df['state'] == state]
+                    if state_df.empty:
+                        continue
+
+                    color = state_palette[state]
+
+                    # Hierarchical average: within-mouse first, then across mice
+                    mouse_means = []
+                    for _, mouse_grp in state_df.groupby('mouse_id'):
+                        windows = np.vstack(mouse_grp['window'].values)
+                        mouse_means.append(windows.mean(axis=0))
+
+                    mouse_means = np.array(mouse_means)  # (n_mice, n_samples)
+                    n_mice = len(mouse_means)
+                    grand_mean = mouse_means.mean(axis=0)
+                    sem = (mouse_means.std(axis=0, ddof=1) / np.sqrt(n_mice)
+                           if n_mice > 1 else np.zeros(n_samples))
+
+                    n_trials = state_df['trial_id'].nunique()
+                    label = f"State {state + 1}  (n={n_mice} mice, {n_trials} trials)"
+
+                    ax.plot(t_axis, grand_mean,
+                            color=color, lw=1.5, label=label)
+                    ax.fill_between(t_axis,
+                                    grand_mean - sem,
+                                    grand_mean + sem,
+                                    color=color, alpha=0.2)
+
+                ax.legend(frameon=False, fontsize=7, loc='upper right')
+
+        out_base.mkdir(parents=True, exist_ok=True)
+        day_suffix = f"_day{day_val}" if day_val is not None else ""
+        save_figure_to_files(
+            fig, str(out_base),
+            f"dlc_traces_{bp}{day_suffix}",
+            suffix=None,
+            file_types=['pdf', 'png'],
+            dpi=200,
+        )
+        plt.close(fig)
+        logger.info(f"  Saved DLC figure for bodypart '{bp}'")
+
+    logger.info(f"  plot_dlc_traces_by_state → {out_base}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STAGE 4  –  PERFORMANCE FIGURES  (entry point)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -5494,7 +5947,7 @@ def stage_plot_performance(cfg, model_name_for_per_mouse: str = "full"):
                 logger.warning(f"  [1] weight diagnostics failed for {mname}: {e}")
 
     # ── Analysis 2 – posterior curves by day ──────────────────────────────────
-    plot_mean_posteriors = True
+    plot_mean_posteriors = False
     if plot_mean_posteriors:
         logger.info(f" Plotting posterior curves by day …")
         for mname in feature_sets:
@@ -5551,7 +6004,7 @@ def stage_plot_performance(cfg, model_name_for_per_mouse: str = "full"):
 
 
     # ── Analysis – weight perf metric correlations  ─────────────────────────
-    plot_weight_beh_metric_correlation=True
+    plot_weight_beh_metric_correlation=False
     if plot_weight_beh_metric_correlation:
         logger.info(f" Plotting correlation between state weights and perf metrics …")
 
@@ -5559,9 +6012,36 @@ def stage_plot_performance(cfg, model_name_for_per_mouse: str = "full"):
             try:
                 plot_weight_metric_correlation(cfg, trial_df, weight_df, figure_path, inflection_df=None)
             except Exception as e:
-                logger.warning(f"  [5] correlating weight and perf failed for {mname}: {e}")
+                logger.warning(f"  [6] correlating weight and perf failed for {mname}: {e}")
 
 
+
+    # Analysis - mean movement DLC by state
+    plot_state_dlc_curves = True
+    if plot_state_dlc_curves:
+        logger.info(f" Plotting DLC mean cruves state weights and perf metrics …")
+
+        base_path = r"M:\analysis\Axel_Bisi\NWB_combined"
+
+        nwb_list = [os.path.join(base_path, f)for f in os.listdir(base_path) if 'AB141_20241129_130221.nwb' in f]
+        print(nwb_list)
+        # Make dict sess_id:path
+        nwb_paths = {NWB_read.get_session_id(f): f for f in nwb_list}
+        print(nwb_paths)
+        print(list_dlc_bodyparts(nwb_list[0]))
+
+        dlc_plot_cfg = {
+            'pre_time': 0.5,
+            'post_time': 1.5,
+            'n_samples': 200,
+            'trial_types': ['wh', 'wm', 'ah', 'am', 'fa', 'cr'],
+            'bodyparts': ['jaw_angle', 'jaw_distance', 'nose_distance', 'pupil_area', 'whisker_angle'],
+            'day_val': 0,  # None → all days pooled
+        }
+        try:
+            plot_dlc_traces_by_state(dlc_plot_cfg, nwb_paths, trial_df, figure_path)
+        except Exception as e:
+            logger.warning(f"  [7] mean DLC per state failed for: {e}")
 
     logger.info(f"Stage 4 complete. Figures → {figure_path}\n")
     return
